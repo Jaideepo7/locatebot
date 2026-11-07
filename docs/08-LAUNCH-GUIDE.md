@@ -17,17 +17,17 @@ All six branches start at the same docs commit. The lanes do **not** start codin
 ## Who runs what, where
 | Seat | Account | Tool / model | Machine | Checkout | Branch |
 |---|---|---|---|---|---|
-| Integrator | Claude Max ($200) | Claude Code, Opus | Jaideep's laptop | `~/Projects/locatebot` | `integration` |
+| Integrator | Claude Max ($200) | Claude Code, Opus | Max owner's own machine | fresh clone | `integration` |
 | Lane A — Safety | Claude Pro #1 | Claude Code, Sonnet (Opus for reviews if allowance permits) | Owner's own machine | fresh clone | `feat/safety` |
 | Lane B — Control | Claude Pro #2 | Claude Code, Sonnet | Owner's own machine | fresh clone | `feat/control` |
 | Lane C — Perception | Claude Pro #3 | Claude Code, Sonnet | Owner's own machine | fresh clone | `feat/perception` |
 | Lane D — Mission | ChatGPT Plus | Codex CLI | Owner's own machine | fresh clone | `feat/mission` |
-| Reviewer | Claude Max (fresh session) or ChatGPT Plus (Codex `/review`) | Whichever model did **not** write the slice | Integrator's laptop | review worktree | read-only |
+| Reviewer | Claude Max (fresh session) or ChatGPT Plus (Codex `/review`) | Whichever model did **not** write the slice | Integrator's machine | review worktree | read-only |
 | Jetson | none yet | — | Jetson Orin Nano Super | — | Not used until hardware gate H1 |
 
 Why this split: the integrator touches every lane and needs the largest allowance, so it gets Max. Lanes are small and well specified, so Pro is enough. Codex on the mission lane, and as a reviewer, gives a second vendor's view on Claude-written code. Pick models from what each tool currently offers; these are suggestions, not pinned versions.
 
-Every seat signs in with its **own** account. Never copy credentials between machines or into the repo. Subscriptions don't include API credit; don't enable paid API fallback without agreeing it first.
+Seats follow the accounts, not the people: whoever holds the Claude Max subscription is the integrator, and Jaideep (repo owner) takes whichever lane matches his own account. Every seat signs in with its **own** account. Never copy credentials between machines or into the repo. Subscriptions don't include API credit; don't enable paid API fallback without agreeing it first.
 
 ### If one person runs several lanes on one laptop
 Use a separate worktree per lane so agents never share a checkout:
@@ -46,13 +46,13 @@ Run one agent per worktree in its own terminal. Two different Claude accounts on
    cd ~/Projects/locatebot
    git push -u origin main integration feat/safety feat/control feat/perception feat/mission
    ```
-   Add teammates as collaborators on `github.com/Jaideepo7/locatebot`.
+   Add teammates as collaborators on `github.com/Jaideepo7/locatebot`. The integrator needs write access to push `integration` and `main`; consider protecting `main` so only the integrator merges into it.
 2. **Teammates clone their lane:**
    ```bash
    git clone https://github.com/Jaideepo7/locatebot.git && cd locatebot
    git switch feat/<lane>
    ```
-3. **Integrator runs the master prompt** (below) on `integration`, reviews the foundation and pushes `integration`.
+3. **Integrator (Max owner) clones the repo, runs the master prompt** (below) on `integration`, reviews the foundation and pushes `integration`.
 4. **Each lane syncs the foundation, then runs its lane prompt:**
    ```bash
    git fetch origin && git merge origin/integration
@@ -62,7 +62,13 @@ Run one agent per worktree in its own terminal. Two different Claude accounts on
 6. **Integrator reviews and merges** one slice at a time into `integration`, reruns the full suite after each merge, and promotes to `main` only when the whole suite and the cross-lane checks pass (see `03-BRANCH-AND-MERGE-PLAN.md` and `05-VERIFICATION-AND-HARDWARE-GATES.md`).
 
 ## Master prompt — integrator (Claude Code, Claude Max, branch `integration`)
-Paste into `claude` started in `~/Projects/locatebot` after `git switch integration`:
+The Max owner runs this on their own machine:
+```bash
+git clone https://github.com/Jaideepo7/locatebot.git && cd locatebot
+git switch integration
+claude   # signed in with the Claude Max account
+```
+Then paste:
 
 ```text
 You are the integrator for locatebot, a Jetson Orin Nano Super RC car that uses LiDAR for
