@@ -5,12 +5,14 @@ from __future__ import annotations
 import importlib.util
 import math
 import struct
+import time
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from locatebot.lidar.rplidar import (
+    NODE_LEN,
     Node,
     RPLidar,
     ScanAssembler,
@@ -263,6 +265,191 @@ def test_rplidar_timeout_when_no_data():
     lidar = RPLidar("/dev/null", transport=fake)
     with pytest.raises(TimeoutError):
         next(lidar.iter_scans())
+
+
+# ---------------------------------------------------------------- robustness: watchdog, stop, recovery
+STOP = b"\xa5\x25"
+
+
+class StreamingTransport(FakeTransport):
+    """Fake port that streams `pattern` forever.
+
+    stale=True models a sensor still streaming from a previous run: every read returns stale
+    pattern bytes (ahead of any response) until STOP is written. After SCAN is written the port
+    serves the scripted response, then the pattern forever. read() fails loudly after max_reads
+    so a missing watchdog shows up as a test failure, not a hang."""
+
+    def __init__(self, responses, pattern, stale=False, max_reads=20000):
+        super().__init__(responses)
+        self.pattern = bytes(pattern)
+        self.stale = stale
+        self.streaming = False
+        self.reads = 0
+        self.max_reads = max_reads
+        self._pos = 0
+
+    def write(self, b):
+        b = bytes(b)
+        if b == STOP:
+            self.stale = False
+            self.streaming = False
+        elif b == b"\xa5\x20":
+            self.streaming = True
+        return super().write(b)
+
+    def _pattern(self, n):
+        out = bytearray()
+        while len(out) < n:
+            take = min(n - len(out), len(self.pattern) - self._pos)
+            out += self.pattern[self._pos:self._pos + take]
+            self._pos = (self._pos + take) % len(self.pattern)
+        return bytes(out)
+
+    def read(self, n):
+        self.reads += 1
+        if self.reads > self.max_reads:
+            raise AssertionError("driver kept reading forever (no watchdog)")
+        if self.stale:
+            return self._pattern(n)
+        if self.rx:
+            return super().read(n)
+        return self._pattern(n) if self.streaming else b""
+
+
+class StepClock:
+    def __init__(self, step=0.01):
+        self.t, self.step = 0.0, step
+
+    def __call__(self):
+        self.t += self.step
+        return self.t
+
+
+NO_START = b"".join(node_bytes(i * 0.9, 1000.0, start=False) for i in range(400))
+
+
+@pytest.mark.parametrize("prefix,pattern", [
+    (b"", NO_START),                                   # valid nodes, start flag never set
+    (node_bytes(0.0, 1000.0, start=True), NO_START),   # one start, then never another
+    (b"", bytes([0x00, 0xFF, 0x13, 0x02]) * 50),       # garbage that never parses
+], ids=["no-start", "one-start", "garbage"])
+def test_iter_scans_times_out_when_no_revolution_completes(prefix, pattern):
+    fake = StreamingTransport({0x20: SCAN_DESCRIPTOR + prefix}, pattern)
+    lidar = RPLidar("/dev/null", transport=fake, clock=StepClock(0.01), sleep=lambda s: None)
+    with pytest.raises(TimeoutError):
+        next(lidar.iter_scans(scan_timeout_s=0.5))
+    assert len(lidar._buf) < NODE_LEN
+    assert fake.writes[-1] == STOP
+
+
+def test_iter_scans_timeout_real_clock_is_quick():
+    fake = StreamingTransport({0x20: SCAN_DESCRIPTOR}, NO_START, max_reads=10**7)
+    lidar = RPLidar("/dev/null", transport=fake, sleep=lambda s: None)
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        next(lidar.iter_scans(scan_timeout_s=0.05))
+    assert time.monotonic() - t0 < 2.0
+
+
+def test_assembler_buffer_bounded_and_waits_for_next_start():
+    asm = ScanAssembler(min_points=5, max_nodes=100)
+    nodes = [Node(0.0, 1000.0, 47, True)] + [Node(i * 0.1 % 360, 1000.0, 47, False) for i in range(25000)]
+    assert asm.feed(nodes) == []
+    assert len(asm._angle) <= 100
+    # the overflowed revolution is dropped: the next start opens a fresh one instead of closing it
+    out = asm.feed(rev(10) + rev(10)[:1])
+    assert [len(s) for s in out] == [10]
+
+
+def test_assembler_stamps_scan_with_first_node_time():
+    now = [1.0]
+    asm = ScanAssembler(min_points=5, clock=lambda: now[0])
+    asm.feed(rev(10))          # start node of revolution 0 read at t=1
+    now[0] = 1.1
+    (s,) = asm.feed(rev(10))   # closed at t=1.1, which also starts revolution 1
+    assert s.stamp_s == 1.0
+    now[0] = 1.2
+    (s,) = asm.feed(rev(10)[:1])
+    assert s.stamp_s == 1.1
+
+
+def test_context_manager_stops_motor_after_start_scan():
+    revs, _ = sim_stream(2)
+    fake = FakeTransport({0x20: SCAN_DESCRIPTOR + revs})
+    with RPLidar("/dev/null", transport=fake, sleep=lambda s: None) as lidar:
+        lidar.start_scan()
+        fake.writes.clear()
+    assert fake.writes == [STOP]
+    assert fake.closed
+
+
+def test_close_without_scanning_sends_nothing():
+    fake = FakeTransport({})
+    RPLidar("/dev/null", transport=fake).close()
+    assert fake.writes == [] and fake.closed
+
+
+def test_generator_close_stops_motor():
+    revs, _ = sim_stream(4)
+    fake = FakeTransport({0x20: SCAN_DESCRIPTOR + revs})
+    lidar = RPLidar("/dev/null", transport=fake, sleep=lambda s: None)
+    gen = lidar.iter_scans()
+    next(gen)
+    fake.writes.clear()
+    gen.close()
+    assert fake.writes == [STOP]
+
+
+def test_break_out_of_iteration_stops_motor():
+    revs, _ = sim_stream(4)
+    fake = FakeTransport({0x20: SCAN_DESCRIPTOR + revs})
+    lidar = RPLidar("/dev/null", transport=fake, sleep=lambda s: None)
+    for _ in lidar.iter_scans():
+        fake.writes.clear()
+        break
+    assert fake.writes == [STOP]
+
+
+def test_max_scans_reached_stops_motor():
+    revs, _ = sim_stream(4)
+    fake = FakeTransport({0x20: SCAN_DESCRIPTOR + revs})
+    lidar = RPLidar("/dev/null", transport=fake, sleep=lambda s: None)
+    assert len(list(lidar.iter_scans(max_scans=2))) == 2
+    assert fake.writes[-1] == STOP
+
+
+def test_exception_inside_iteration_stops_motor():
+    revs, _ = sim_stream(4)
+    fake = FakeTransport({0x20: SCAN_DESCRIPTOR + revs})
+    lidar = RPLidar("/dev/null", transport=fake, sleep=lambda s: None)
+    with pytest.raises(RuntimeError, match="boom"):
+        for _ in lidar.iter_scans():
+            fake.writes.clear()
+            raise RuntimeError("boom")
+    assert fake.writes == [STOP]
+
+
+def test_transport_error_inside_iteration_stops_motor():
+    fake = FakeTransport({0x20: SCAN_DESCRIPTOR})  # stream goes silent -> TimeoutError
+    lidar = RPLidar("/dev/null", transport=fake, sleep=lambda s: None)
+    with pytest.raises(TimeoutError):
+        next(lidar.iter_scans())
+    assert fake.writes[-1] == STOP
+
+
+def test_commands_recover_sensor_that_is_already_streaming():
+    health = bytes([0xA5, 0x5A, 0x03, 0, 0, 0, 0x06, 0x00, 0x00, 0x00])
+    revs, _ = sim_stream(3)
+    stale = node_bytes(0.0, 900.0, start=True) + NO_START
+    sleeps = []
+    fake = StreamingTransport({0x52: health, 0x20: SCAN_DESCRIPTOR + revs}, stale, stale=True)
+    lidar = RPLidar("/dev/null", transport=fake, sleep=sleeps.append)
+    assert lidar.get_health() == (0, 0)
+    assert fake.writes[:2] == [STOP, b"\xa5\x52"]
+    assert sleeps and sleeps[0] >= 0.001
+    fake.stale = True  # crash again while streaming
+    lidar.start_scan()
+    assert fake.writes[-2:] == [STOP, b"\xa5\x20"]
 
 
 # ---------------------------------------------------------------- record_scan CLI

@@ -1,10 +1,13 @@
 """Tests for the .lbscan scan log format."""
 from __future__ import annotations
 
+import struct
+import zlib
+
 import numpy as np
 import pytest
 
-from locatebot.lidar.scanlog import ScanLogWriter, read_scan_log
+from locatebot.lidar.scanlog import MAX_BEAMS, ScanLogWriter, read_scan_log
 from locatebot.lidar.sim import Room, simulate_scan
 from locatebot.lidar.types import Pose2D, Scan
 
@@ -29,7 +32,7 @@ def test_round_trip(tmp_path):
     p = tmp_path / "a.lbscan"
     scans = make_scans()
     write_log(p, scans)
-    assert p.read_bytes()[:8] == b"LBSCAN1\0"
+    assert p.read_bytes()[:8] == b"LBSCAN2\0"
     back = list(read_scan_log(p))
     assert len(back) == len(scans)
     for a, b in zip(scans, back):
@@ -63,7 +66,7 @@ def test_crc_corruption_detected(tmp_path):
     p = tmp_path / "c.lbscan"
     write_log(p, make_scans(2))
     data = bytearray(p.read_bytes())
-    data[8 + 20 + 100] ^= 0xFF  # inside the first record's payload
+    data[8 + 24 + 100] ^= 0xFF  # inside the first record's payload
     p.write_bytes(bytes(data))
     with pytest.raises(ValueError):
         list(read_scan_log(p))
@@ -84,3 +87,42 @@ def test_flush_per_record(tmp_path):
         assert len(list(read_scan_log(p))) == 1
         w.write(scans[1])
         assert len(list(read_scan_log(p))) == 2
+
+
+REC = 24 + 9 * 300 + 4  # header + header CRC, payload of 300 beams, record CRC
+
+
+@pytest.mark.parametrize("byte,mask", [(0, 0x01), (3, 0x80)], ids=["low-bit", "high-bit"])
+def test_bit_flip_in_record_header_n_detected(tmp_path, byte, mask):
+    p = tmp_path / "n.lbscan"
+    write_log(p, make_scans(3))
+    data = bytearray(p.read_bytes())
+    assert len(data) == 8 + 3 * REC
+    data[8 + REC + 16 + byte] ^= mask  # n field of the middle record
+    p.write_bytes(bytes(data))
+    with pytest.raises(ValueError, match="header CRC"):
+        list(read_scan_log(p))
+
+
+def test_n_above_max_beams_rejected_on_read(tmp_path):
+    p = tmp_path / "big.lbscan"
+    header = struct.pack("<dqI", 1.0, 0, MAX_BEAMS + 1)
+    p.write_bytes(b"LBSCAN2\0" + header + struct.pack("<I", zlib.crc32(header)) + b"\0" * 64)
+    with pytest.raises(ValueError, match="MAX_BEAMS|n="):
+        list(read_scan_log(p))
+
+
+def test_n_above_max_beams_rejected_on_write(tmp_path):
+    p = tmp_path / "w.lbscan"
+    n = MAX_BEAMS + 1
+    with ScanLogWriter(p) as w:
+        with pytest.raises(ValueError):
+            w.write(Scan(0.0, 0, np.zeros(n), np.ones(n), np.zeros(n)))
+    assert list(read_scan_log(p)) == []
+
+
+def test_old_lbscan1_magic_rejected_clearly(tmp_path):
+    p = tmp_path / "old.lbscan"
+    p.write_bytes(b"LBSCAN1\0" + b"\0" * 40)
+    with pytest.raises(ValueError, match="LBSCAN1"):
+        list(read_scan_log(p))
