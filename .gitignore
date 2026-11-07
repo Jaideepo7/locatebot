@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.worktrees/
+*.egg-info/
+recordings/private/
+maps/private/
+.env
