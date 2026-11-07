@@ -7,3 +7,5 @@ __pycache__/
 recordings/private/
 maps/private/
 .env
+models/
+third_party/
