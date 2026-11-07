@@ -15,21 +15,23 @@ class Obstacle:
 
 def clean_scan(scan: Scan, range_min_m: float = RANGE_MIN_M, range_max_m: float = RANGE_MAX_M,
                min_quality: int = 1, spike_jump_m: float = 0.3) -> Scan
-    # out-of-range, low-quality and isolated spikes (a point that differs from BOTH angular neighbours by > spike_jump_m while the neighbours agree with each other within spike_jump_m) become NaN. Same angles, stamp, seq.
+    # out-of-range, low-quality and isolated FAR spikes (a point that is FARTHER than BOTH angular neighbours by > spike_jump_m while the neighbours agree with each other within spike_jump_m) become NaN. A point CLOSER than both neighbours is kept: it may be a real thin obstacle hit by one beam. Same angles, stamp, seq.
 def sector_clearance(scan: Scan, n_sectors: int = 8) -> np.ndarray
     # min valid range per sector; sector 0 centred on forward (angle 0), sectors in CCW order; NaN when a sector has no valid return (unknown, NOT free)
 def corridor_clearance(scan: Scan, half_width_m: float, max_lookahead_m: float = RANGE_MAX_M) -> float
-    # smallest x > 0 among valid points with |y| <= half_width_m and x <= max_lookahead_m; math.inf if none
-def forward_coverage(scan: Scan, fov_rad: float = math.pi) -> float
-    # fraction of beams with |angle| <= fov_rad/2 that have a valid return; 0.0 if no beams in the FOV
+    # smallest x > 0 among valid points with |y| <= half_width_m and x <= max_lookahead_m; math.inf if none.
+    # inf means "nothing seen", NOT "free": callers must require high forward_coverage before trusting it.
+def forward_coverage(scan: Scan, fov_rad: float = math.pi, bin_rad: float = math.radians(2.0)) -> float
+    # fraction of angular bins (width <= bin_rad) across [-fov_rad/2, +fov_rad/2] that contain at least one VALID return; bins with no beams or only invalid beams are uncovered; 0.0 for an empty scan. Vectorised.
 def cluster_scan(scan: Scan, break_distance_m: float = 0.15, break_ratio: float = 0.03, min_points: int = 3) -> list[Obstacle]
     # sort valid points by angle; start a new cluster where the gap between consecutive points > break_distance_m + break_ratio * range; join the last and first cluster across the -pi/+pi seam; drop clusters with < min_points; return sorted by nearest_range_m
 ```
 ## Required tests (use `sim.Room` + `simulate_scan`)
-- `clean_scan` removes NaN/out-of-range/low-quality and a planted spike but keeps a genuine 3-point edge.
+- `clean_scan` removes NaN/out-of-range/low-quality and a planted far spike but keeps a genuine 3-point edge.
+- `clean_scan` keeps a single-beam pole at 1 m in front of a 3 m wall (`corridor_clearance(clean_scan(scan), half_width_m=0.2)` ~= 1.0) and still removes a single far outlier between two near agreeing neighbours.
 - Sector clearance: box in front shows in sector 0; left wall in sector 2 of 8; empty sector gives NaN.
 - Corridor clearance: obstacle inside the corridor is reported, one just outside the width is not, nothing → inf.
-- Forward coverage drops when you add dropout to the forward half.
+- Forward coverage drops when you add dropout to the forward half; a full 450-beam scan gives ~1.0; a scan with no beams at |angle| < 0.6 rad gives <= (pi - 1.2)/pi + small tolerance.
 - Clustering: two separate boxes give two obstacles with correct nearest ranges/bearings; a box straddling the ±pi seam is one cluster; walls of an empty room do not produce clusters smaller than min_points.
 - Timing test for 1,000 beams.
 

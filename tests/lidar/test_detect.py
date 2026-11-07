@@ -30,7 +30,7 @@ def _with_ranges(scan: Scan, ranges, quality=None) -> Scan:
 
 # ---------------------------------------------------------------- clean_scan
 
-def test_clean_scan_removes_invalid_and_spike_keeps_three_point_edge():
+def test_clean_scan_removes_invalid_and_far_spike_keeps_three_point_edge():
     room = Room.box(4.0, 4.0)
     scan = simulate_scan(room, Pose2D(2.0, 2.0, 0.0), n_beams=360, noise_std_m=0.0, stamp_s=1.5, seq=7)
     r = scan.ranges_m.copy()
@@ -39,9 +39,9 @@ def test_clean_scan_removes_invalid_and_spike_keeps_three_point_edge():
     r[20] = 0.01              # below RANGE_MIN_M
     r[30] = 20.0              # above RANGE_MAX_M
     q[40] = 0                 # low quality
-    r[100] = r[100] - 1.0     # isolated spike (both neighbours agree)
+    r[100] = r[100] + 1.0     # isolated FAR spike (both neighbours agree)
     r[200:203] = r[200:203] - 1.0  # genuine 3-point object edge
-    r[0] = r[0] - 1.0         # spike on the -pi/+pi seam (neighbours are beams 359 and 1)
+    r[0] = r[0] + 1.0         # far spike on the -pi/+pi seam (neighbours are beams 359 and 1)
     out = clean_scan(_with_ranges(scan, r, q))
 
     assert out.stamp_s == 1.5 and out.seq == 7
@@ -64,10 +64,32 @@ def test_clean_scan_keeps_point_next_to_unknown_neighbour():
 
 def test_clean_scan_handles_unsorted_angles():
     a = np.array([0.02, -0.02, 0.0, 0.04, -0.04])
-    r = np.array([2.0, 2.0, 1.0, 2.0, 2.0])   # beam at angle 0 is a spike
+    r = np.array([2.0, 2.0, 3.0, 2.0, 2.0])   # beam at angle 0 is a far spike
     out = clean_scan(Scan(0.0, 0, a, r, np.full(5, 47)))
     assert np.isnan(out.ranges_m[2])
     assert np.isfinite(out.ranges_m[[0, 1, 3, 4]]).all()
+
+
+def test_clean_scan_removes_single_far_outlier_between_agreeing_neighbours():
+    a = np.linspace(-0.1, 0.1, 5)
+    r = np.array([1.0, 1.0, 3.0, 1.0, 1.0])
+    out = clean_scan(Scan(0.0, 0, a, r, np.full(5, 47)))
+    assert np.isnan(out.ranges_m[2])
+    np.testing.assert_allclose(out.ranges_m[[0, 1, 3, 4]], 1.0)
+
+
+def test_clean_scan_keeps_single_beam_thin_obstacle_closer_than_neighbours():
+    # Safety: a thin pole hit by one beam is CLOSER than both neighbours; it must survive.
+    wall = Room(np.array([[3.0, -3.0, 3.0, 3.0]]))
+    scan = simulate_scan(wall, Pose2D(0.0, 0.0, 0.0), n_beams=450, noise_std_m=0.0)
+    r = scan.ranges_m.copy()
+    i = int(np.argmin(np.abs(scan.angles_rad)))   # beam at angle 0
+    r[i] = 1.0
+    pole = _with_ranges(scan, r)
+    assert corridor_clearance(pole, half_width_m=0.2) == pytest.approx(1.0, abs=1e-6)
+    out = clean_scan(pole)
+    assert out.ranges_m[i] == 1.0
+    assert corridor_clearance(out, half_width_m=0.2) == pytest.approx(1.0, abs=1e-6)
 
 
 # ---------------------------------------------------------- sector_clearance
@@ -114,18 +136,22 @@ def test_corridor_clearance_inside_outside_and_none():
 
 # ----------------------------------------------------------- forward_coverage
 
+def test_forward_coverage_full_scan_is_one():
+    scan = simulate_scan(Room.box(4.0, 4.0), Pose2D(2.0, 2.0, 0.0), n_beams=450)
+    assert forward_coverage(scan) == pytest.approx(1.0)
+    assert forward_coverage(scan, fov_rad=2 * math.pi) == pytest.approx(1.0)
+
+
 def test_forward_coverage_drops_with_forward_dropout():
     room = Room.box(4.0, 4.0)
     scan = simulate_scan(room, Pose2D(2.0, 2.0, 0.0))
     assert forward_coverage(scan) == pytest.approx(1.0)
 
-    rng = np.random.default_rng(1)
     r = scan.ranges_m.copy()
-    fwd = np.abs(scan.angles_rad) <= math.pi / 2
-    r[fwd & (rng.random(len(r)) < 0.5)] = np.nan
+    r[np.abs(scan.angles_rad) < 0.5] = np.nan     # 1 rad of the forward half unknown
     dropped = _with_ranges(scan, r)
     cov = forward_coverage(dropped)
-    assert 0.3 < cov < 0.7
+    assert (math.pi - 1.0) / math.pi - 0.03 < cov < (math.pi - 1.0) / math.pi + 0.03
     # rear half is untouched, so a rear-only "FOV" check would still be fine
     assert forward_coverage(dropped, fov_rad=2 * math.pi) > cov
 
@@ -133,6 +159,21 @@ def test_forward_coverage_drops_with_forward_dropout():
 def test_forward_coverage_no_beams_in_fov():
     a = np.array([3.0, -3.0])
     assert forward_coverage(Scan(0.0, 0, a, np.array([1.0, 1.0]), np.full(2, 47))) == 0.0
+
+
+def test_forward_coverage_empty_scan_is_zero():
+    e = np.zeros(0)
+    assert forward_coverage(Scan(0.0, 0, e, e, np.zeros(0, dtype=int))) == 0.0
+
+
+def test_forward_coverage_counts_missing_beams_as_uncovered():
+    # Safety: beams physically absent around forward (not just invalid) must lower coverage.
+    scan = simulate_scan(Room.box(4.0, 4.0), Pose2D(2.0, 2.0, 0.0), n_beams=450, noise_std_m=0.0)
+    keep = np.abs(scan.angles_rad) >= 0.6
+    holed = Scan(scan.stamp_s, scan.seq, scan.angles_rad[keep], scan.ranges_m[keep], scan.quality[keep])
+    assert corridor_clearance(holed, half_width_m=0.2) == math.inf   # "nothing seen" ...
+    tol = 2 * math.radians(2.0) / math.pi
+    assert forward_coverage(holed) <= (math.pi - 1.2) / math.pi + tol   # ... and coverage says so
 
 
 # --------------------------------------------------------------- cluster_scan

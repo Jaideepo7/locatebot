@@ -7,8 +7,11 @@ emergency stop, so the semantics are fail-safe:
 * `sector_clearance` reports NaN (unknown) for a sector with no valid return.
 * `corridor_clearance` returns ``math.inf`` when no valid point lies in the corridor; that
   only means "nothing seen", so callers must gate it on `forward_coverage`.
-* `clean_scan` only removes a point when its neighbours *prove* it is an isolated spike;
-  a point next to an unknown beam is kept.
+* `clean_scan` only removes a point when its neighbours *prove* it is an isolated FAR
+  spike; a point CLOSER than both neighbours is kept (it may be a thin obstacle such as a
+  pole or chair leg), and a point next to an unknown beam is kept.
+* `forward_coverage` measures ANGULAR coverage (bins with a valid return), so beams that
+  are missing entirely count as uncovered, not just beams that returned invalid.
 
 "Valid" everywhere means `Scan.valid_mask()` (finite and within RANGE_MIN_M..RANGE_MAX_M).
 Quality filtering happens in `clean_scan`; run it first on raw sensor scans.
@@ -48,8 +51,10 @@ def clean_scan(scan: Scan, range_min_m: float = RANGE_MIN_M, range_max_m: float 
     """Return a copy of `scan` with bad beams set to NaN (unknown).
 
     Removed: non-finite, out of [range_min_m, range_max_m], quality < min_quality, and isolated
-    spikes: a point that differs from BOTH angular neighbours by > spike_jump_m while those
-    neighbours agree with each other within spike_jump_m. Neighbours are taken in angular
+    FAR spikes: a point that is FARTHER than BOTH angular neighbours by > spike_jump_m while
+    those neighbours agree with each other within spike_jump_m. A point CLOSER than both
+    neighbours is never removed: for the emergency stop it may be a real thin obstacle hit by
+    a single beam, and dropping it would report the wall behind it. Neighbours are taken in angular
     order (angles need not be sorted) and wrap across the -pi/+pi seam; they are the
     neighbouring beams after range/quality filtering, so a point next to an unknown beam is
     never called a spike. Angles, quality, stamp and seq are unchanged.
@@ -66,7 +71,8 @@ def clean_scan(scan: Scan, range_min_m: float = RANGE_MIN_M, range_max_m: float 
         prev = np.roll(rs, 1)
         nxt = np.roll(rs, -1)
         # Comparisons involving NaN are False, so unknown neighbours never flag a spike.
-        spike = (np.abs(rs - prev) > spike_jump_m) & (np.abs(rs - nxt) > spike_jump_m) & \
+        # Only FAR outliers: a near single-beam return may be a thin obstacle and is kept.
+        spike = (rs - prev > spike_jump_m) & (rs - nxt > spike_jump_m) & \
                 (np.abs(prev - nxt) <= spike_jump_m)
         r[order[spike]] = np.nan
 
@@ -95,8 +101,10 @@ def sector_clearance(scan: Scan, n_sectors: int = 8) -> np.ndarray:
 def corridor_clearance(scan: Scan, half_width_m: float, max_lookahead_m: float = RANGE_MAX_M) -> float:
     """Smallest x > 0 among valid points with |y| <= half_width_m and x <= max_lookahead_m.
 
-    Returns math.inf if no such point. inf means "nothing seen", not "verified free":
-    combine with `forward_coverage` before trusting it.
+    Returns math.inf if no such point. inf means "nothing seen", NOT "verified free": a scan
+    with missing or invalid beams ahead also gives inf. Callers MUST require a high
+    `forward_coverage` (e.g. close to 1.0 over the driving FOV) before treating inf, or any
+    large value, as clear; otherwise treat the corridor as unknown and stop.
     """
     p = scan.points_xy()
     x, y = p[:, 0], p[:, 1]
@@ -106,15 +114,29 @@ def corridor_clearance(scan: Scan, half_width_m: float, max_lookahead_m: float =
     return float(x[sel].min())
 
 
-def forward_coverage(scan: Scan, fov_rad: float = math.pi) -> float:
-    """Fraction of beams with |angle| <= fov_rad/2 that have a valid return; 0.0 if none in the FOV."""
-    in_fov = np.abs(_wrap(scan.angles_rad)) <= fov_rad / 2.0
-    if fov_rad >= _TWO_PI:
-        in_fov[:] = True
-    n = int(in_fov.sum())
-    if n == 0:
-        return 0.0
-    return float((scan.valid_mask() & in_fov).sum()) / n
+def forward_coverage(scan: Scan, fov_rad: float = math.pi, bin_rad: float = math.radians(2.0)) -> float:
+    """Fraction of angular bins across [-fov_rad/2, +fov_rad/2] that contain a valid return.
+
+    The FOV is split into ceil(fov_rad / bin_rad) equal bins (width <= bin_rad). A bin counts
+    as covered only if at least one VALID beam (`Scan.valid_mask()`) falls in it; bins with no
+    beams at all, or only invalid beams, are uncovered. So a scan missing every beam in a
+    forward wedge reports that wedge as uncovered, unlike a per-beam fraction. Returns 0.0 for
+    an empty scan or no valid return in the FOV. fov_rad >= 2*pi covers the full circle.
+    Use it to gate `corridor_clearance` / `sector_clearance` before trusting "nothing seen".
+    """
+    if fov_rad <= 0.0 or bin_rad <= 0.0:
+        raise ValueError("fov_rad and bin_rad must be > 0")
+    fov = min(fov_rad, _TWO_PI)
+    n_bins = max(1, math.ceil(fov / bin_rad - 1e-9))
+    w = fov / n_bins
+    a = _wrap(scan.angles_rad[scan.valid_mask()])
+    half = fov / 2.0
+    if fov < _TWO_PI:
+        a = a[np.abs(a) <= half]
+    idx = np.clip(np.floor((a + half) / w).astype(np.intp), 0, n_bins - 1)
+    covered = np.zeros(n_bins, dtype=bool)
+    covered[idx] = True
+    return float(covered.sum()) / n_bins
 
 
 def cluster_scan(scan: Scan, break_distance_m: float = 0.15, break_ratio: float = 0.03,
