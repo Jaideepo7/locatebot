@@ -5,6 +5,11 @@ byte streams; it has NOT been checked against a real C1. The parser is therefore
 malformed nodes (check bit clear, S == !S, angle >= 360 deg) are skipped one byte at a time
 so the stream resyncs, and the first partial revolution after start_scan is discarded.
 
+Safety (the scans feed an emergency stop): iter_scans raises TimeoutError when no complete
+revolution arrives within scan_timeout_s even if bytes keep flowing; STOP is sent on every
+exit from iter_scans and by close() while scanning; every command that expects a response
+descriptor first sends STOP and flushes, so a sensor left streaming by a crash is recovered.
+
 Sensor angles increase clockwise seen from above; scans are converted to the robot frame
 (+x forward, CCW positive) with wrap_angle(-radians(angle_deg) + mount_offset_rad).
 """
@@ -93,15 +98,23 @@ def parse_scan_nodes(buf: bytes | bytearray) -> tuple[list[Node], int]:
 
 
 class ScanAssembler:
-    """Group nodes into revolutions. Synthetic-tested only."""
+    """Group nodes into revolutions. Synthetic-tested only.
+
+    Each Scan is stamped with clock() taken when its start node was fed (i.e. when the chunk
+    holding the revolution's first node was read), not when the revolution was closed.
+    A revolution that grows past max_nodes without a start flag is discarded and the assembler
+    waits for the next start flag, so the buffer stays bounded on a broken stream.
+    """
 
     def __init__(self, mount_offset_rad: float = 0.0, min_points: int = 50,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, max_nodes: int = 10000):
         self.mount_offset_rad = float(mount_offset_rad)
         self.min_points = int(min_points)
         self.clock = clock
+        self.max_nodes = int(max_nodes)
         self._seq = 0
         self._seen_start = False
+        self._stamp = 0.0
         self._angle: list[float] = []
         self._dist: list[float] = []
         self._qual: list[int] = []
@@ -117,7 +130,7 @@ class ScanAssembler:
         ang = -np.radians(deg) + self.mount_offset_rad
         ang = (ang + math.pi) % (2.0 * math.pi) - math.pi
         rng = np.where(mm > 0.0, mm / 1000.0, np.nan)
-        scan = Scan(stamp_s=float(self.clock()), seq=self._seq, angles_rad=ang, ranges_m=rng,
+        scan = Scan(stamp_s=self._stamp, seq=self._seq, angles_rad=ang, ranges_m=rng,
                     quality=np.asarray(self._qual, dtype=np.uint8))
         self._seq += 1
         return scan
@@ -131,9 +144,14 @@ class ScanAssembler:
                     if s is not None:
                         out.append(s)
                 self._seen_start = True
+                self._stamp = float(self.clock())
                 self._clear()
             if not self._seen_start:
-                continue  # partial first revolution
+                continue  # partial first revolution, or waiting after an overflow
+            if len(self._angle) >= self.max_nodes:
+                self._seen_start = False  # no start flag for too long: drop, wait for next one
+                self._clear()
+                continue
             self._angle.append(nd.angle_deg)
             self._dist.append(nd.distance_mm)
             self._qual.append(nd.quality)
@@ -141,14 +159,20 @@ class ScanAssembler:
 
 
 class RPLidar:
-    """Minimal RPLIDAR driver. `transport` needs read(n), write(b), reset_input_buffer(), close()."""
+    """Minimal RPLIDAR driver. `transport` needs read(n), write(b), reset_input_buffer(), close().
+
+    clock and sleep are injectable so tests can drive the watchdog and STOP delays.
+    """
 
     def __init__(self, port: str, baudrate: int = 460800, timeout_s: float = 1.0, transport=None,
-                 mount_offset_rad: float = 0.0):
+                 mount_offset_rad: float = 0.0, clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep):
         self.port = port
         self.baudrate = baudrate
         self.timeout_s = timeout_s
         self.mount_offset_rad = mount_offset_rad
+        self._clock = clock
+        self._sleep = sleep
         if transport is None:
             import serial  # lazy: pyserial is only needed on real hardware
 
@@ -175,6 +199,11 @@ class RPLidar:
         return bytes(out)
 
     def _request(self, cmd: int, expect_type: int, expect_mode: int) -> int:
+        # The sensor may still be streaming (e.g. after a crash): stop it, let the last
+        # in-flight nodes arrive, then flush them so the descriptor read is not misaligned.
+        self._send(CMD_STOP)
+        self._scanning = False
+        self._sleep(0.005)
         self._t.reset_input_buffer()
         self._send(cmd)
         length, mode, dtype = parse_descriptor(self._read_exact(DESCRIPTOR_LEN))
@@ -208,29 +237,48 @@ class RPLidar:
     def stop(self) -> None:
         self._send(CMD_STOP)
         self._scanning = False
-        time.sleep(0.002)  # protocol asks for >= 1 ms before the next request
+        self._sleep(0.002)  # protocol asks for >= 1 ms before the next request
 
-    def iter_scans(self, max_scans: int | None = None) -> Iterator[Scan]:
-        """Yield full revolutions; starts scanning if needed. Raises TimeoutError if data stops."""
-        if not self._scanning:
-            self.start_scan()
-        asm = ScanAssembler(mount_offset_rad=self.mount_offset_rad)
-        count = 0
-        while max_scans is None or count < max_scans:
-            chunk = self._t.read(_READ_CHUNK)
-            if not chunk:
-                raise TimeoutError(f"no scan data from lidar within {self.timeout_s} s")
-            self._buf += chunk
-            nodes, used = parse_scan_nodes(self._buf)
-            del self._buf[:used]
-            for scan in asm.feed(nodes):
-                yield scan
-                count += 1
-                if max_scans is not None and count >= max_scans:
-                    return
+    def iter_scans(self, max_scans: int | None = None, scan_timeout_s: float = 2.0) -> Iterator[Scan]:
+        """Yield full revolutions; starts scanning if needed.
+
+        Raises TimeoutError if the port goes silent, or if no complete Scan has been produced
+        for scan_timeout_s of wall-clock time while bytes keep arriving (garbage, or nodes that
+        never set the start flag). Scanning is stopped (STOP sent) on every exit: max_scans
+        reached, generator closed / loop broken, or any exception.
+        """
+        try:
+            if not self._scanning:
+                self.start_scan()
+            asm = ScanAssembler(mount_offset_rad=self.mount_offset_rad, clock=self._clock)
+            count = 0
+            last_scan = self._clock()
+            while max_scans is None or count < max_scans:
+                chunk = self._t.read(_READ_CHUNK)
+                if not chunk:
+                    raise TimeoutError(f"no scan data from lidar within {self.timeout_s} s")
+                self._buf += chunk
+                nodes, used = parse_scan_nodes(self._buf)
+                del self._buf[:used]
+                for scan in asm.feed(nodes):
+                    yield scan
+                    count += 1
+                    last_scan = self._clock()
+                    if max_scans is not None and count >= max_scans:
+                        return
+                if self._clock() - last_scan > scan_timeout_s:
+                    raise TimeoutError(f"lidar data arriving but no complete scan within {scan_timeout_s} s")
+        finally:
+            if self._scanning:
+                self.stop()
 
     def close(self) -> None:
-        self._t.close()
+        """Send STOP if scanning, then close the transport."""
+        try:
+            if self._scanning:
+                self.stop()
+        finally:
+            self._t.close()
 
     def __enter__(self) -> "RPLidar":
         return self

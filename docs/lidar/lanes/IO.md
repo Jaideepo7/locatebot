@@ -19,27 +19,33 @@ def build_request(cmd: int) -> bytes
 def parse_descriptor(buf: bytes) -> tuple[int, int, int]          # (length, mode, data_type); ValueError if bad sync
 def parse_scan_nodes(buf: bytes | bytearray) -> tuple[list[Node], int]  # (nodes, bytes_consumed); skips 1 byte at a time on a bad node so it resyncs
 class ScanAssembler:
-    def __init__(self, mount_offset_rad: float = 0.0, min_points: int = 50, clock: Callable[[], float] = time.monotonic): ...
+    def __init__(self, mount_offset_rad: float = 0.0, min_points: int = 50, clock: Callable[[], float] = time.monotonic, max_nodes: int = 10000): ...
     def feed(self, nodes: Iterable[Node]) -> list[Scan]   # emits a Scan each time a start node closes a revolution with >= min_points nodes; seq increments; distance 0 -> NaN
+    # stamp_s = clock() when the revolution's start node was fed; > max_nodes without a start flag -> buffer discarded, wait for next start
 class RPLidar:
-    def __init__(self, port: str, baudrate: int = 460800, timeout_s: float = 1.0, transport=None, mount_offset_rad: float = 0.0): ...
+    def __init__(self, port: str, baudrate: int = 460800, timeout_s: float = 1.0, transport=None, mount_offset_rad: float = 0.0,
+                 clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep): ...
     # transport: object with read(n) -> bytes, write(b), reset_input_buffer(), close(); default opens pyserial lazily
     def get_health(self) -> tuple[int, int]
     def get_info(self) -> dict
     def start_scan(self) -> None
     def stop(self) -> None
-    def iter_scans(self, max_scans: int | None = None) -> Iterator[Scan]
-    def close(self) -> None   # also context manager
+    def iter_scans(self, max_scans: int | None = None, scan_timeout_s: float = 2.0) -> Iterator[Scan]
+    def close(self) -> None   # also context manager; sends STOP first if scanning
 ```
+Safety (scans feed the emergency stop):
+- `iter_scans` raises `TimeoutError` if the port goes silent, or if no complete Scan has been produced for `scan_timeout_s` of wall-clock time (`clock`) while bytes keep arriving.
+- STOP (`A5 25`) is sent on every exit from `iter_scans` (max_scans reached, generator closed / loop broken, any exception) and by `close()`/`__exit__` while scanning.
+- Every command expecting a response descriptor (SCAN, GET_INFO, GET_HEALTH) first sends STOP, sleeps ~5 ms (`sleep`), calls `reset_input_buffer()`, then sends, so a sensor still streaming after a crash is recovered.
 The first, partial revolution after `start_scan` must be discarded (no start node seen yet).
 
 ## Scan log format `.lbscan`
-File magic `b"LBSCAN1\0"`, then records: header `struct "<dqI"` (stamp_s, seq, n), then `n` float32 angles, `n` float32 ranges (NaN kept), `n` uint8 quality, then u32 CRC32 of header+payload.
+File magic `b"LBSCAN2\0"`, then records: header `struct "<dqI"` (stamp_s, seq, n), u32 CRC32 of those 20 header bytes, then `n` float32 angles, `n` float32 ranges (NaN kept), `n` uint8 quality, then u32 CRC32 of header (20 bytes) + payload. `n <= MAX_BEAMS = 20000` (ValueError above it on write and read). The old `LBSCAN1` format is rejected with a ValueError naming it.
 ```python
 class ScanLogWriter:  # context manager
     def __init__(self, path): ...
     def write(self, scan: Scan) -> None   # flush per record
-def read_scan_log(path) -> Iterator[Scan]   # stops cleanly at a truncated last record (power loss); raises ValueError on bad magic or CRC mismatch
+def read_scan_log(path) -> Iterator[Scan]   # stops cleanly at a record cut off at EOF (power loss); ValueError on bad magic, bad header CRC, n > MAX_BEAMS or payload CRC mismatch
 ```
 `tools/record_scan.py`: `--port`, `--baud` (default 460800), `--out`, `--seconds`, `--mount-offset-deg`; prints health/info, scans/second and count at exit; Ctrl+C stops the motor and closes the file cleanly.
 
@@ -49,6 +55,7 @@ def read_scan_log(path) -> Iterator[Scan]   # stops cleanly at a truncated last 
 - Assembler: partial first revolution discarded, revolution split on start flag, clockwise→CCW conversion and mount offset, distance 0 → NaN, min_points respected.
 - RPLidar with a fake transport fed bytes generated from `sim.simulate_scan` output: `iter_scans` yields scans matching the simulated ranges within the q2/q6 quantisation; `stop()` writes `A5 25`.
 - Scan log round trip (float32 tolerance, NaN preserved), truncated tail tolerated, CRC corruption detected.
+- Robustness: endless start-less nodes / garbage -> TimeoutError and bounded buffers; STOP written on context-manager exit, generator close/break, max_scans and exceptions; commands succeed against a fake that streams stale nodes until STOP; a bit flip in a record's n -> ValueError; LBSCAN1 -> ValueError.
 
 ## Rules for every lane
 - Work only in your worktree and only in the files listed for your lane. `locatebot/lidar/types.py`, `locatebot/lidar/sim.py`, `pyproject.toml` and this README belong to the integrator; if you need a change there, stop and report it.
