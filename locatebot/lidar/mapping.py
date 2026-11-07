@@ -44,19 +44,23 @@ class Mapper:
         return result
 
     def save(self, stem: str | Path, meta: dict | None = None) -> dict[str, Path]:
-        """Write <stem>.lbmap (the session map file) plus <stem>.pgm/.yaml for viewing."""
+        """Write <stem>.lbmap (the session map file) plus <stem>.pgm/.yaml for viewing.
+
+        Anything outside the grid (default 20 x 20 m around the start) is not mapped.
+        """
         stem = Path(stem)
         stem.parent.mkdir(parents=True, exist_ok=True)
-        full_meta = {
+        full_meta = dict(meta or {})
+        full_meta.update({  # pipeline fields win over caller meta
             "format": "locatebot-session-map",
             "created_unix_s": time.time(),
             "scans": self.n_scans,
             "integrated": self.n_integrated,
             "rejected": self.n_rejected,
             "trajectory": self.trajectory,
-        }
-        full_meta.update(meta or {})
-        paths = {"lbmap": stem.with_suffix(".lbmap"), "pgm": stem.with_suffix(".pgm"), "yaml": stem.with_suffix(".yaml")}
+        })
+        # Append suffixes instead of with_suffix() so dotted stems like "2026.11.07" survive.
+        paths = {k: stem.with_name(stem.name + "." + k) for k in ("lbmap", "pgm", "yaml")}
         save_map(paths["lbmap"], self.grid, full_meta)
         export_ros_map(self.grid, paths["pgm"], paths["yaml"])
         return paths
@@ -76,7 +80,8 @@ def build_map_from_log(log_path: str | Path, out_stem: str | Path, size_m: float
         "integrated": mapper.n_integrated,
         "rejected": mapper.n_rejected,
         "seconds": elapsed,
-        "final_pose": [mapper.odometry.pose.x, mapper.odometry.pose.y, mapper.odometry.pose.theta],
+        # Last pose actually integrated into the map (odometry.pose may be a dead-reckoned guess after rejections).
+        "final_pose": list(mapper.trajectory[-1][1:]) if mapper.trajectory else None,
         "files": {k: str(v) for k, v in paths.items()},
     }
 

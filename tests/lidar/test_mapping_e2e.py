@@ -82,3 +82,32 @@ def test_build_map_from_scan_log(tmp_path):
     assert summary["scans"] == 20
     assert summary["integrated"] >= 18
     assert (tmp_path / "out.lbmap").exists()
+
+
+def test_save_keeps_dotted_stem_names(tmp_path):
+    mapper = Mapper(size_m=16.0)
+    _explore(mapper, demo_room(), demo_trajectory()[:3])
+    paths = mapper.save(tmp_path / "2026.11.07")
+    assert paths["lbmap"].name == "2026.11.07.lbmap"
+    assert paths["pgm"].name == "2026.11.07.pgm"
+
+
+def test_caller_meta_cannot_overwrite_pipeline_fields(tmp_path):
+    mapper = Mapper(size_m=16.0)
+    _explore(mapper, demo_room(), demo_trajectory()[:3])
+    paths = mapper.save(tmp_path / "s", meta={"trajectory": [], "scans": -1, "note": "kept"})
+    _, meta = load_map(paths["lbmap"])
+    assert len(meta["trajectory"]) == mapper.n_integrated
+    assert meta["scans"] == mapper.n_scans
+    assert meta["note"] == "kept"
+
+
+def test_summary_final_pose_is_last_integrated_pose(tmp_path):
+    log = tmp_path / "r.lbscan"
+    rng = np.random.default_rng(2)
+    with ScanLogWriter(log) as w:
+        for i, pose in enumerate(demo_trajectory()[:5]):
+            w.write(simulate_scan(demo_room(), pose, rng=rng, stamp_s=i * 0.1, seq=i))
+    s = build_map_from_log(log, tmp_path / "o", size_m=16.0)
+    _, meta = load_map(tmp_path / "o.lbmap")
+    assert s["final_pose"] == meta["trajectory"][-1][1:]
