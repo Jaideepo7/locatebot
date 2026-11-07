@@ -66,7 +66,7 @@ The lanes import only `types.py` and `sim.py`, never each other, so they merge w
 ## Rules for every lane
 - Work only in your worktree and only in the files listed for your lane. `locatebot/lidar/types.py`, `locatebot/lidar/sim.py`, `pyproject.toml` and this README belong to the integrator; if you need a change there, stop and report it.
 - Python >= 3.10, numpy only (pyserial allowed lazily inside the RPLIDAR driver). No other dependencies, no network, no hardware access.
-- Test first: write the tests, run them and see them fail, implement, then run the **whole** suite: `PYTHONPATH=. /opt/data/projects/locatebot-venv/bin/python -m pytest -q`.
+- Test first: write the tests, run them and see them fail, implement, then run the **whole** suite: `PYTHONPATH=. .venv/bin/python -m pytest -q`.
 - Use `locatebot.lidar.sim` for synthetic rooms/scans. Synthetic tests prove software behaviour, not real-sensor behaviour; say so in docstrings where it matters.
 - Vectorise with numpy; no per-beam Python loops in hot paths unless the brief allows it.
 - Commit only your files with a conventional message (`feat(lidar-<lane>): ...`). Do not merge, push, or touch other branches.
