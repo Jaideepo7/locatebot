@@ -1,6 +1,35 @@
 # LiDAR detection and map building
 
-**Status:** foundation committed; four lanes in progress on `lidar/*` branches. Hardware not yet tested: the RPLIDAR C1 driver is written from the published protocol and only tested against synthetic byte streams.
+**Status:** all four lanes merged into `lidar-integration`, reviewed, and review fixes merged; 121 tests pass. **Not yet tested on hardware:** the RPLIDAR C1 driver is written from the published protocol and only tested against synthetic byte streams; matching/mapping accuracy is measured on simulated rooms only.
+
+## Quick start
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e '.[hardware,dev]'
+python -m pytest -q                                   # 121 tests, no hardware needed
+
+# Synthetic demo map (no hardware): writes maps/demo.lbmap, .pgm, .yaml
+python tools/build_map.py --demo --out maps/demo --size 16
+
+# On the Pi with the RPLIDAR C1 plugged in (C1 default 460800 baud; A1M8 uses 115200):
+python tools/record_scan.py --port /dev/ttyUSB0 --out recordings/room1.lbscan --seconds 60
+# Then build the session map (on the Orin or a laptop):
+python tools/build_map.py --log recordings/room1.lbscan --out maps/room1 --size 20
+```
+The `.lbmap` file is the session map ("bin file"): log-odds grid + JSON metadata (trajectory, scan counts) + CRC. Open `maps/<name>.pgm` in any image viewer, or load `<name>.yaml` in ROS tools.
+
+## First hardware session checklist
+1. `record_scan.py` prints health/info and scans/second; expect about 10 scans/s on the C1.
+2. Put a box straight in front of the sensor; confirm it shows up at angle 0 (forward). If it appears elsewhere, set `--mount-offset-deg`.
+3. Measure a known distance with a tape and compare.
+4. Record a slow walk around the room carrying the car (no motors), then build the map and check it looks like the room.
+5. Only after that, record while driving slowly.
+
+## Known limitations
+- No loop closure: drift grows on long runs; keep exploration loops short.
+- Motion during one revolution (scan skew) is not corrected; drive slowly while mapping.
+- `corridor_clearance` returns inf when nothing is seen; the safety stop must also require high `forward_coverage`.
+- A 2D scan misses obstacles above or below the sensor plane, glass and drop-offs.
 
 ## What this subsystem does
 1. **Read** the RPLIDAR C1 (fallbacks: Oradar MS200, RPLIDAR A1M8) and produce one `Scan` per revolution. Record/replay scans to `.lbscan` files so the team can develop without the car.
