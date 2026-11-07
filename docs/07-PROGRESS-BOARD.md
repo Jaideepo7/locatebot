@@ -3,7 +3,7 @@
 ## Current state
 Documentation prepared. Architecture decisions await review. Implementation is paused by user instruction. No coding agents running, no subscriptions authenticated here, no hardware evidence and no remote repository configured by this documentation task.
 
-Before the correction, a separate preliminary scaffold/local Git branches were created at `/opt/data/projects/rc-lidar-robot`. Those are not the planned finished project, are not included in this Markdown folder, and must not be silently reused as an approved foundation. Leave them untouched unless the user decides how to reuse/archive them.
+Branches `integration`, `feat/safety`, `feat/control`, `feat/perception` and `feat/mission` exist at the docs commit. Start with the master prompt in `08-LAUNCH-GUIDE.md`.
 
 ## Planned tasks
 | ID | Owner lane | Deliverable | Depends on | State |
