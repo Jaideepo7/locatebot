@@ -11,13 +11,13 @@ Run from the repo root.
 
 | Command | What it does | Status |
 |---|---|---|
-| `python3 -m venv .venv && .venv/bin/pip install -e '.[hardware,dev]'` | Install package + pyserial + pytest | verified (exit 0, 2026-11-08, x86 Linux, Python 3.14) |
+| `python3 -m venv .venv && .venv/bin/pip install -e '.[hardware,dev,link]'` (or `uv pip install --python .venv/bin/python -e '.[hardware,dev,link]'`) | Install package + pyserial + pyzmq + pytest | verified (exit 0, 2026-11-08, x86 Linux, Python 3.14) |
 | `.venv/bin/python -m pytest -q` | Full test suite, no hardware needed | verified (exit 0, 2026-11-08) |
 | `.venv/bin/python tools/build_map.py --demo --out maps/demo --size 16` | Synthetic exploration → `maps/demo.lbmap/.pgm/.yaml` | verified (exit 0, 2026-11-08) |
 | `.venv/bin/python tools/build_map.py --log <file>.lbscan --out maps/<name>` | Session map from a recorded scan log | verified via test suite only (synthetic log) |
 | `.venv/bin/python tools/record_scan.py --port /dev/ttyUSB0 --out recordings/<name>.lbscan --seconds 60` | Record from a real RPLIDAR (C1 default 460800 baud; A1M8 needs `--baud 115200`) | unverified: never run against real hardware |
 | `scripts/get_model.sh` | Download pinned q4_k model to `models/`, resumable, SHA-256 checked | verified (exit 0, 2026-11-08, x86) |
-| `scripts/build_locate_anything.sh` | Build pinned locate-anything.cpp (CLI + `liblocate_anything.so`) into `third_party/` | verified CPU-only on x86 (2026-11-07); CUDA build on the Orin unverified |
+| `scripts/build_locate_anything.sh` | Build pinned locate-anything.cpp (CLI + `liblocate_anything.so`) into `third_party/`, applying `scripts/patches/` | verified CPU on x86 (2026-11-07) and CUDA on the Orin (2026-11-08) |
 
 ## Generated and downloaded files: never commit
 | Path | Source | Regenerate |
@@ -29,7 +29,7 @@ Run from the repo root.
 Model weights are NVIDIA-licensed (research/non-commercial). Never add them to git, LFS or any upload.
 
 ## Ownership
-- Integrator-owned shared contracts: `locatebot/lidar/types.py`, `locatebot/lidar/sim.py`, `pyproject.toml`, `docs/PROJECT.md`. Don't change them inside a lane; propose the change instead.
+- Integrator-owned shared contracts: `locatebot/lidar/types.py`, `locatebot/lidar/sim.py`, `locatebot/mission/types.py`, `pyproject.toml`, `docs/PROJECT.md`. Don't change them inside a lane; propose the change instead.
 - Lane modules import only shared contracts, never each other's modules, so branches merge without conflicts.
 - Branch per lane, merge into an integration branch after an independent review, then fast-forward `main`.
 
@@ -56,6 +56,7 @@ Model weights are NVIDIA-licensed (research/non-commercial). Never add them to g
 - **Corrupted scan logs:** without a header CRC, one flipped bit made a log read as empty. `.lbscan` is now `LBSCAN2` with a header CRC; old `LBSCAN1` files are rejected.
 - **Map names:** `Path.with_suffix` cut dotted names (`2026.11.07` → `2026.11.lbmap`). `Mapper.save` appends suffixes instead.
 - **Prompts:** `remote control` found nothing where `remote` found both remotes, and `a</c>b` prompts found only the first item. Test each item's wording; prefer one item per call.
-- **Model speed:** about 50 s per photo on an x86 laptop CPU, mostly inference (the model loads in about 4 s). Don't design around CPU numbers; measure on the Orin GPU.
+- **Model speed:** about 50 s per photo on an x86 laptop CPU. On the Orin GPU about 2.1 s per item at 640 px; 1600 px frames run out of GPU memory. Send 640 px frames.
+- **Orin GPU memory:** the unpatched engine keeps a host copy of all weights and fails to load on the Orin's shared memory; keep `scripts/patches/locate-anything-streamed-weights.patch`.
 - **Orin power:** the Orin Nano dev kit can't be powered over USB-C; use the barrel jack.
 <!-- omh:agent-instructions:end -->

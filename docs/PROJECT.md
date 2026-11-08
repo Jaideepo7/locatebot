@@ -2,7 +2,7 @@
 
 **This is the current source of truth for the whole project.** The numbered planning docs (`docs/00-…` to `docs/08-…`) were written before the Raspberry Pi + Jetson split and before any code existed; where they disagree with this file, this file wins.
 
-Last updated: 2026-11-07.
+Last updated: 2026-11-08.
 
 ---
 
@@ -93,13 +93,17 @@ A web dashboard shows the map, the item list, found items, robot health, and off
 | Occupancy grid + `.lbmap` map file (`grid.py`, `mapfile.py`) | Orin | **Done**, synthetic tests |
 | Session mapping pipeline + CLI (`mapping.py`, `tools/build_map.py`) | Orin | **Done**, end-to-end synthetic test |
 | Model download (`scripts/get_model.sh`) | Orin | **Done**, tested on x86 server |
-| Engine build (`scripts/build_locate_anything.sh`) | Orin | **Done**, CPU build tested on x86; CUDA build on Orin untested |
-| Vision daemon (`locatebot/vision/`) | Orin | Designed (§7), not built |
+| Engine build (`scripts/build_locate_anything.sh`) | Orin | **Done**, CUDA build on the Orin verified with the streamed-weights patch |
+| Vision engine + worker (`locatebot/vision/`) | Orin | **Done**; runs on the Orin GPU, ~2.1 s per item at 640 px |
 | Pi ↔ Orin link + Pi safety stop + motor driver | Pi/Orin | Planned, needs motor hardware details |
 | Item localization | Orin | Planned |
 | Autonomous exploration | Orin | Planned |
 | Mission manager | Orin | Planned |
 | SpacetimeDB module + dashboard | Orin/laptop | Planned (§9) |
+| Nav-lite (`locatebot/nav/`) | Orin | In progress (§8a) |
+| LLM agent + fallback (`locatebot/agent/`) | Orin/laptop | In progress (§8a) |
+| Pi runtime + manual drive page (`locatebot/pi/`) | Pi | In progress (§8a), real motor driver needs hardware details |
+| Link transport (`locatebot/link/transport.py`) | Pi/Orin | In progress (§8a) |
 
 Nothing has run on the real car, LiDAR, camera or Orin yet.
 
@@ -199,6 +203,32 @@ Bearing from the vision daemon + LiDAR range along that bearing at the frame's c
 
 ---
 
+## 8a. LLM body: skills, Nav-lite and fallback (decided 2026-11-08)
+
+An LLM is the high-level "brain"; the robot is its body. **The LLM decides *what*, the robot decides *how*.** It never drives the wheels.
+
+```text
+LLM ──(on events or every few s)──▶ SkillCall ──▶ skill executor (Nav-lite) ──▶ drive ──▶ Pi safety stop ──▶ motors
+ ▲                                                    │
+ └──── WorldState text summary ◀── pose, sector clearances, map coverage, item tracks, skill status
+```
+
+- **Contracts:** `locatebot/mission/types.py` (integrator-owned): `SkillName`, `SKILL_ARGS`, `SkillCall`, `SkillStatus`, `ItemView`, `WorldState`, `VehicleConfig`.
+- **Skills (the only actions):** `explore`, `search(items)`, `go_to(item | x,y)`, `follow(item)`, `look_around`, `stop`, `return_home`. Arguments are validated before running.
+- **Nav-lite (`locatebot/nav/`):** A* on the occupancy grid inflated by the car's half-width, path smoothing, pure-pursuit steering for a car-like (Ackermann) chassis with speed scaled by clearance, frontier exploration. No ROS.
+- **Agent (`locatebot/agent/`):** `WorldState` → compact text; skills → tool definitions; pluggable LLM client (cloud API or local OpenAI-compatible server, decided later); **approve mode** (operator confirms each call) and **auto mode**.
+- **Fallback:** if the LLM times out, errors or returns an invalid call, the current skill finishes and a preset routine runs (default: `stop`). Routines are plain skill lists, no AI.
+- **Follow:** vision locks on to the item's bearing; the LiDAR cluster in that direction is tracked at scan rate; vision re-confirms every few seconds (the model takes ~2 s per frame).
+- LocateAnything only finds what it is asked for: the LLM chooses the items to look for.
+- The Pi safety stop and E-stop override every skill and every LLM decision.
+- Open question: where the LLM runs (cloud API over a hotspot breaks the no-internet rule; local model on the laptop is weaker). The Orin has no RAM for an LLM next to LocateAnything.
+
+### Pi runtime (`locatebot/pi/`)
+Control tick: newest scan + chosen command (manual from the local dashboard beats mission from the Orin) → `SafetySupervisor.evaluate` → `MotorDriver`. Latched E-stop released only locally. Hold-to-drive: manual commands expire after `command_timeout_s`. `MotorDriver` is an interface with a fake; the real driver waits for the motor/steering hardware details.
+
+### Link transport (`locatebot/link/transport.py`)
+ZeroMQ PUB/SUB over the `messages.py` frames (`pyzmq`, extra `[link]`): newest-only for frames and drive commands, `seq` replay protection, re-stamp on receipt.
+
 ## 9. Dashboard and backend
 
 **Backend:** SpacetimeDB, **run locally** (laptop by default; Orin only if its ARM build installs and leaves enough memory), TypeScript module. It holds slow-changing shared state: item list, found items, mission state, health numbers, saved sessions. The Orin's Python code talks to it through a small Node bridge or the HTTP API. **The robot must work fully if SpacetimeDB is down.**
@@ -273,3 +303,5 @@ Priority for 24 h: E-stop + manual drive with video → mission view → health 
 | 2026-11-07 | Model = mudler q4_k GGUF via locate-anything.cpp, pinned, never committed |
 | 2026-11-07 | Backend = local SpacetimeDB (TypeScript module); no cloud, no internet dependency |
 | 2026-11-07 | Dashboard: mission view, health (no battery), manual drive with video + E-stop |
+| 2026-11-08 | Orin GPU needs the streamed-weights engine patch and 640 px frames (~2.1 s per item) |
+| 2026-11-08 | LLM as high-level brain through fixed skills; Nav-lite (own A* + pure pursuit + frontiers) instead of Nav2; preset routines as fallback |
