@@ -46,5 +46,22 @@ The times include loading the 4.7 GB model on every CLI call and are CPU-only, s
 - Expect near-duplicate boxes for the same object: merge same-label boxes that overlap heavily (IoU > 0.7) in the wrapper.
 - Some prompts returned a whole-image box when the object was absent or ambiguous; the wrapper must reject boxes covering most of the frame.
 
-## Next: Python wrapper (not built yet)
-The engine has a C API (`include/la_capi.h`): `la_capi_load` once, then `la_capi_locate_buffer(ctx, jpeg_bytes, len, prompt, mode)` per photo, so the 4.7 GB model stays loaded. Plan: `locatebot/vision/` with a ctypes binding, a background worker that keeps only the newest photo, and box→bearing conversion from the camera's field of view for placing items on the LiDAR map.
+## Python wrapper (built, tested against a fake engine)
+- `locatebot/vision/engine.py`: `LocateEngine(model, lib_path)` loads the model once via the C API (ABI v1); `locate(jpeg_bytes, prompt, mode)` returns `Detection`s with pixel boxes. Calls block and can't be cancelled: run them in a background worker.
+- `locatebot/vision/postprocess.py`: `build_prompt` (one item per prompt), `merge_duplicates` (same label, IoU > 0.7), `drop_oversized` (> 80 % of frame), `bearing_rad` (robot frame, left positive), `jpeg_size`.
+- `tools/locate.py`: time real photos with the model loaded once:
+  ```bash
+  .venv/bin/python tools/locate.py photos/desk.jpg="tape measure,marker" --mode hybrid --repeat 2 --out results/run1.json
+  ```
+- Tests (`tests/vision/`) compile `fake_la_capi.c` into a fake `liblocate_anything.so`; they prove the binding, not the real model or the Orin GPU build.
+
+## Vision worker (built, tested with a fake engine)
+`locatebot/vision/service.py`: `VisionService(engine, on_result, hfov_rad, mode, on_heartbeat)`.
+- `submit_frame(jpeg, capture_s)` keeps only the newest frame; a frame replaced before any call used it counts as dropped.
+- `set_items([...])` one item per call, rotating; each item runs at most once per frame, then the worker waits for a new frame.
+- A running call can't be cancelled; if its item was removed meanwhile the result is discarded.
+- Every finished call emits a `VisionResult` (item, frame capture time, cleaned boxes with bearings, latency), including "nothing found".
+- `pause()` / `resume()` / `status()`; heartbeat callback every `heartbeat_s` with counters, last latency, last error.
+- Engine errors and callback exceptions are logged and counted; the worker keeps running.
+
+Not built yet: the transport (ZeroMQ frames in from the Pi, results/heartbeat out), `config/camera.yaml`, and the `systemd` unit. Those need the Pi <-> Orin link format and the `pyzmq` dependency.
