@@ -309,7 +309,7 @@ def test_bad_config():
 
 
 # ---------------------------------------------------------------- "continue": keep the running skill
-SEARCH = SkillCall(SkillName.SEARCH, {"items": ["marker", "bolt"]}, "", "llm")
+SEARCH = SkillCall(SkillName.SEARCH, {"items": ("marker", "bolt")}, "", "llm")  # as parse_tool_call stores it
 
 
 def test_continue_while_running_is_a_success_and_emits_nothing():

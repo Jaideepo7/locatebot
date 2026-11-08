@@ -9,27 +9,36 @@ Every message is three byte frames, ready for a ZeroMQ multipart send:
 - ``payload``: binary data (scan arrays, JPEG bytes) or ``b""``.
 
 Directions and clocks
-- Pi -> Orin: ``Scan``, ``Frame``, ``PiStatus``. All their times are the **Pi's monotonic
-  clock**, so scan stamps and frame capture times line up on the Orin (pose lookup for
-  item localization uses both).
-- Orin -> Pi: ``DriveCmd``, ``EStopCmd``, ``OrinStatus``. ``sent_s`` is the Orin's clock and
-  is for latency diagnostics only. The Pi must stamp a command with its own clock **on
-  receipt** before giving it to the safety supervisor; it never compares Orin times with
-  Pi times.
+- Pi -> Orin: ``Scan``, ``Frame``, ``PiStatus``, ``Range``. All their times are the **Pi's
+  monotonic clock**, so scan stamps, range readings and frame capture times line up on the
+  Orin (pose lookup for item localization uses them).
+- Pi -> Orin: ``MissionRequest``, ``MissionCancel`` (Telegram/Photon missions). The one
+  exception to the clock rule: ``issued_s`` / ``expires_s`` are **Unix wall-clock** seconds
+  (``time.time()``) because a mission is born outside the car; the Orin compares them with its
+  own wall clock and a skew tolerance, so both machines need NTP/chrony.
+- Orin -> Pi: ``DriveCmd``, ``EStopCmd``, ``OrinStatus``, ``MissionStatus``. ``sent_s`` is the
+  Orin's clock and is for latency diagnostics only. The Pi must stamp a command with its own
+  clock **on receipt** before giving it to the safety supervisor; it never compares Orin times
+  with Pi times. ``OrinStatus.boot_id`` changes on every Orin process start: when it changes
+  the Pi resets its drive ``seq`` filter (``DriveReceiver.reset``).
 
-Decoding is strict: wrong frame count, version, type, missing fields, bad payload size or
-out-of-range drive values raise ``ProtocolError``; the receiver drops the message (for drive
+Decoding is strict: wrong frame count, version, type, missing fields, bad payload size,
+out-of-range drive or range values, an unknown mission state, or a string that is too long,
+empty where it must not be, or contains control characters raise ``ProtocolError`` (encode
+checks the same rules); the receiver drops the message (for drive
 commands the safety supervisor then times out and stops). Unknown extra header fields are
 ignored so a newer sender can add fields without breaking an older receiver.
 
-Planned sockets (not implemented here): Pi PUB on tcp port 5555 (scan, frame, pi_status),
-Orin PUB on tcp port 5556 (drive, estop, orin_status); frame subscribers set CONFLATE so
-only the newest frame is kept.
+Sockets (``transport.py``): Pi PUB on tcp port 5555 (scan, frame, pi_status, range,
+mission_request, mission_cancel), Orin PUB on tcp port 5556 (drive, estop, orin_status,
+mission_status). Frame subscribers keep only the newest frame; mission topics must never be
+newest-only.
 """
 from __future__ import annotations
 
 import json
 import math
+import unicodedata
 from dataclasses import dataclass, fields
 
 import numpy as np
@@ -38,6 +47,13 @@ from locatebot.lidar.types import Scan
 
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 4 * 1024 * 1024  # JPEGs larger than this are a bug, not a photo
+MAX_ID_CHARS = 64        # mission_id, boot_id, sensor
+MAX_TARGET_CHARS = 120   # MissionRequest.target
+MAX_MESSAGE_CHARS = 300  # MissionStatus.message
+MAX_REASON_CHARS = 64    # MissionCancel.reason, MissionStatus.reason (short codes, may be empty)
+# Mission states in protocol order (same names as the remote/Photon protocol).
+MISSION_STATES = ("PENDING", "ACCEPTED", "SEARCHING", "TARGET_DETECTED", "APPROACHING",
+                  "COMPLETED", "FAILED", "CANCELLED")
 PI_PUB_PORT = 5555
 ORIN_PUB_PORT = 5556
 
@@ -89,9 +105,63 @@ class OrinStatus:
     mission_state: str
     cpu_temp_c: float | None
     gpu_temp_c: float | None
+    boot_id: str        # random per Orin process start (e.g. uuid4().hex); a change = Orin restarted
 
 
-# field kinds for JSON-only messages: "f" float, "f?" optional float, "i" int, "b" bool, "s" str
+@dataclass(frozen=True)
+class Range:
+    """One distance reading from a single-beam sensor on the Pi (Pi -> Orin, topic ``range``).
+
+    ``range_m`` is None when the sensor got no echo (nothing in range, or an absorbing/angled
+    surface): unknown, never "free". ``fov_rad`` is the full cone angle (HC-SR04 ~0.26 rad).
+    """
+
+    stamp_s: float           # Pi monotonic clock, time of the measurement
+    sensor: str              # e.g. "front_ultrasonic"
+    range_m: float | None    # >= 0, None = no echo
+    fov_rad: float           # full cone angle, (0, pi]
+
+
+@dataclass(frozen=True)
+class MissionRequest:
+    """A customer/operator mission for the Orin (Pi -> Orin, topic ``mission_request``).
+
+    ``target`` is the normalised object description (``/find blue toolbox`` -> "blue toolbox").
+    Times are Unix wall-clock seconds; the Orin rejects expired or far-future requests.
+    """
+
+    mission_id: str
+    target: str
+    issued_s: float          # Unix wall clock
+    expires_s: float         # Unix wall clock
+
+
+@dataclass(frozen=True)
+class MissionCancel:
+    """Cancel a mission (Pi -> Orin, topic ``mission_cancel``). ``reason`` may be empty."""
+
+    mission_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class MissionStatus:
+    """Mission progress from the Orin (Orin -> Pi, topic ``mission_status``).
+
+    ``state`` is one of ``MISSION_STATES``; ``message`` is a short human-readable text (may be
+    empty); ``reason`` is a short code such as ``NOT_FOUND`` (empty when there is none).
+    """
+
+    mission_id: str
+    state: str
+    message: str
+    reason: str
+
+
+# field kinds for JSON-only messages: "f" float, "f?" optional float, "i" int, "b" bool, "s" str,
+# and checked strings: "id" (1..MAX_ID_CHARS), "target" (1..MAX_TARGET_CHARS),
+# "message" (0..MAX_MESSAGE_CHARS), "reason" (0..MAX_REASON_CHARS), "state" (in MISSION_STATES).
+# Checked strings must not contain control characters; non-empty ones must not be blank.
 _JSON_TYPES: dict[str, tuple[type, dict[str, str]]] = {
     "drive": (DriveCmd, {"throttle": "f", "steering": "f", "seq": "i", "sent_s": "f"}),
     "estop": (EStopCmd, {"engage": "b", "seq": "i", "sent_s": "f"}),
@@ -99,8 +169,18 @@ _JSON_TYPES: dict[str, tuple[type, dict[str, str]]] = {
                              "estop": "b", "safety_reason": "s", "throttle": "f", "steering": "f",
                              "cpu_temp_c": "f?"}),
     "orin_status": (OrinStatus, {"stamp_s": "f", "vision_alive": "b", "vision_latency_s": "f?",
-                                 "mission_state": "s", "cpu_temp_c": "f?", "gpu_temp_c": "f?"}),
+                                 "mission_state": "s", "cpu_temp_c": "f?", "gpu_temp_c": "f?",
+                                 "boot_id": "id"}),
+    "range": (Range, {"stamp_s": "f", "sensor": "id", "range_m": "f?", "fov_rad": "f"}),
+    "mission_request": (MissionRequest, {"mission_id": "id", "target": "target", "issued_s": "f",
+                                         "expires_s": "f"}),
+    "mission_cancel": (MissionCancel, {"mission_id": "id", "reason": "reason"}),
+    "mission_status": (MissionStatus, {"mission_id": "id", "state": "state", "message": "message",
+                                       "reason": "reason"}),
 }
+# checked string kinds: (min length, max length)
+_TEXT_LIMITS = {"id": (1, MAX_ID_CHARS), "target": (1, MAX_TARGET_CHARS),
+                "message": (0, MAX_MESSAGE_CHARS), "reason": (0, MAX_REASON_CHARS)}
 _TYPE_OF = {cls: name for name, (cls, _) in _JSON_TYPES.items()}
 _SCAN_DT = [np.dtype("<f4"), np.dtype("<f4"), np.dtype("u1")]
 
@@ -109,6 +189,37 @@ def _check_drive(throttle: float, steering: float) -> None:
     for name, v in (("throttle", throttle), ("steering", steering)):
         if not (isinstance(v, (int, float)) and math.isfinite(v) and abs(v) <= 1.0):
             raise ProtocolError(f"drive {name} must be finite and within [-1, 1], got {v!r}")
+
+
+def _has_control(text: str) -> bool:
+    return any(unicodedata.category(ch) == "Cc" for ch in text)
+
+
+def _check_fields(type_: str, spec: dict[str, str], values: dict) -> None:
+    """Rules shared by encode and decode beyond the basic JSON types."""
+    for key, kind in spec.items():
+        v = values[key]
+        if kind in _TEXT_LIMITS or kind == "state":
+            if not isinstance(v, str):
+                raise ProtocolError(f"{type_}.{key} must be a string")
+            if _has_control(v):
+                raise ProtocolError(f"{type_}.{key} contains control characters")
+        if kind in _TEXT_LIMITS:
+            lo, hi = _TEXT_LIMITS[kind]
+            if len(v) > hi:
+                raise ProtocolError(f"{type_}.{key} longer than {hi} characters")
+            if lo and not v.strip():
+                raise ProtocolError(f"{type_}.{key} must not be empty")
+        elif kind == "state" and v not in MISSION_STATES:
+            raise ProtocolError(f"{type_}.{key} {v[:40]!r} is not a mission state")
+    if type_ == "drive":
+        _check_drive(values["throttle"], values["steering"])
+    elif type_ == "range":
+        r, fov = values["range_m"], values["fov_rad"]
+        if r is not None and r < 0.0:
+            raise ProtocolError(f"range.range_m must be >= 0 or null, got {r!r}")
+        if not 0.0 < fov <= math.pi:
+            raise ProtocolError(f"range.fov_rad must be in (0, pi], got {fov!r}")
 
 
 def _header(type_: str, **fields_) -> bytes:
@@ -142,8 +253,6 @@ def encode(msg) -> list[bytes]:
     type_ = _TYPE_OF.get(type(msg))
     if type_ is None:
         raise TypeError(f"cannot encode {type(msg).__name__}")
-    if isinstance(msg, DriveCmd):
-        _check_drive(msg.throttle, msg.steering)
     spec = _JSON_TYPES[type_][1]
     body = {}
     for f in fields(msg):
@@ -151,6 +260,7 @@ def encode(msg) -> list[bytes]:
         if spec[f.name] == "f" and not _finite(v):
             raise ProtocolError(f"{type_}.{f.name} must be finite, got {v!r}")
         body[f.name] = _wire_value(v)
+    _check_fields(type_, spec, body)
     return [type_.encode(), _header(type_, **body), b""]
 
 
@@ -220,6 +330,5 @@ def decode(parts: list[bytes]):
         raise ProtocolError(f"unexpected payload on {type_} message")
     cls, spec = _JSON_TYPES[type_]
     values = {k: _get(hdr, k, kind) for k, kind in spec.items()}
-    if cls is DriveCmd:
-        _check_drive(values["throttle"], values["steering"])
+    _check_fields(type_, spec, values)
     return cls(**values)

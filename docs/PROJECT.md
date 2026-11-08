@@ -214,7 +214,7 @@ LLM ──(on events or every few s)──▶ SkillCall ──▶ skill executor
  └──── WorldState text summary ◀── pose, sector clearances, map coverage, item tracks, skill status
 ```
 
-- **Contracts:** `locatebot/mission/types.py` (integrator-owned): `SkillName`, `SKILL_ARGS`, `SkillCall`, `SkillStatus`, `ItemView`, `WorldState`, `VehicleConfig`.
+- **Contracts:** `locatebot/mission/types.py` (integrator-owned): `SkillName`, `SKILL_ARGS`, `SkillCall`, `SkillStatus`, `ItemView`, `PersonView`, `ChangeView`, `WorldState` (incl. `goal`, `people`, `changes`, `notes`), `VehicleConfig`. Link messages (`locatebot/link/messages.py`) add `Range`, `MissionRequest`, `MissionCancel`, `MissionStatus` and `OrinStatus.boot_id` (2026-11-08).
 - **Skills (the only actions):** `explore`, `search(items)`, `go_to(item | x,y)`, `follow(item)`, `look_around`, `stop`, `return_home`. Arguments are validated before running.
 - **Nav-lite (`locatebot/nav/`):** A* on the occupancy grid inflated by the car's half-width, path smoothing, pure-pursuit steering for a car-like (Ackermann) chassis with speed scaled by clearance, frontier exploration. No ROS.
 - **Agent (`locatebot/agent/`):** `WorldState` → compact text; skills → tool definitions; pluggable LLM client (cloud API or local OpenAI-compatible server, decided later); **approve mode** (operator confirms each call) and **auto mode**.

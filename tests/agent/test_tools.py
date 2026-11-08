@@ -99,7 +99,7 @@ def test_bad_item_strings(v):
 
 def test_search_items():
     c = parse_tool_call("search", {"items": ["marker", " bolt", "marker"]})
-    assert c.args == {"items": ["marker", "bolt"]}
+    assert c.args == {"items": ("marker", "bolt")}
     for bad in ([], "marker", ["ok", ""], ["ok", 3], [f"i{k}" for k in range(MAX_ITEMS + 1)], None):
         with pytest.raises(InvalidSkillCall):
             parse_tool_call("search", {"items": bad})
@@ -116,3 +116,16 @@ def test_validate_skill_call_round_trip():
     assert c == SkillCall(SkillName.GO_TO, {"x": 2.0, "y": 3.0}, "op", "operator")
     with pytest.raises(InvalidSkillCall):
         validate_skill_call(SkillCall(SkillName.FOLLOW, {}))
+
+
+def test_search_items_are_a_tuple_from_a_json_list():
+    assert SKILL_ARGS[SkillName.SEARCH]["items"] == (tuple, True)
+    by = {t["name"]: t for t in tool_definitions()}
+    assert by["search"]["input_schema"]["properties"]["items"]["type"] == "array"
+    from_json = parse_tool_call("search", json.loads('{"items": ["marker", "bolt"]}'))
+    assert isinstance(from_json.args["items"], tuple)
+    assert parse_tool_call("search", {"items": ("marker", "bolt")}) == from_json
+    hash(from_json.args["items"])  # immutable: safe to keep in sets / dict keys
+    assert json.loads(json.dumps(dict(from_json.args))) == {"items": ["marker", "bolt"]}
+    c = validate_skill_call(SkillCall(SkillName.SEARCH, {"items": ["marker"]}, "", "operator"))
+    assert c.args == {"items": ("marker",)}
