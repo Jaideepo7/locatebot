@@ -56,6 +56,9 @@ The brain wakes the LLM on events (an item confirmed, a skill ended, a safety st
 
 Scans, the 10 Hz control step and the 20 Hz drive sender run on separate threads. The sender repeats the newest command and sends zero if the control step has produced nothing for 0.5 s; the Pi stops the car if commands stop for 0.3 s. A one-off planning spike (228 ms on the laptop when a search builds its patrol, so roughly 0.6 s on the Orin) therefore makes the car pause, not run blind. If pauses are frequent on the car, move planning to a background thread.
 
+## Never drive on an untrusted pose (saved-map mode)
+With `--map`, the pose comes from localizing in the saved map. While the localizer is **lost**, **ambiguous** or **not localized yet**, the pose is frozen at the last good value, so `OrinRuntime.step` outputs zero and doesn't tick skills. **Lost** (after having been localized) also cancels the running skill (`stopped: localization lost ...`), because its plan was built on a pose that is now wrong; **not localized yet / ambiguous** only holds, so a skill sent a moment early starts once the pose is trusted. Either way it adds a `localization ...; holding still` note for the LLM and logs one event when it starts and `localization recovered` when it ends. Recover with `/relocalize` (operator pose or `{}` for a global search). New-map (odometry) mode is unaffected. Tests: `tests/orin/test_pose_guard.py`.
+
 ## Clocks
 Scans and frames from the Pi carry Pi monotonic stamps. `PeerClock` estimates the Pi-minus-Orin offset (running maximum of `stamp - receive time`, slowly decayed) so the runtime runs on the Pi timeline. Local LiDAR and `--sim` use the Orin clock directly.
 

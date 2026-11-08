@@ -131,6 +131,7 @@ React + TypeScript + SpacetimeDB client, **all assets bundled, no CDN**, served 
 ---
 
 ## R — remote control via Photon/Telegram, on the Pi (rework of `feat/photon-dispatch`)
+**Status 2026-11-08: R1–R4 done in software** (branch `remote/lane`, merged via `rm-integration`): messaging core in `locatebot/remote/`, Photon inbound over **Socket.IO** (Photon's WebSocket delivery is Socket.IO, per its docs), `tools/remote_run.py`, LLM goal input, mission bridge over ZeroMQ. Not yet run against real Photon/Telegram, the Pi or the cable (R5).
 **Review of the branch (2026-11-08):** 4 commits by chanabyte, 39 files, ~4,700 lines; branched before the Pi+Orin runtime existed. It merges onto `main` with one trivial `.gitignore` conflict and all 867 tests pass together. Verdict: **keep the messaging half, replace the robot half.**
 
 | Part | Fit | Action |
@@ -161,6 +162,7 @@ Follow TEST-PLAN L1–L4 from the branch (`docs/dispatch/TEST-PLAN.md`): real pr
 ---
 
 ## M — smart map: long-term map, people, extra layers [SW in sim now, validate after G2]
+**Status 2026-11-08: M1–M3 done in software** (branch `map/lane`, merged via `rm-integration`): localization in saved maps (mm-level on the real static recordings), static/dynamic layers + change detection + `.lbmap` v2, people tracker, ultrasonic glass layer, Wi-Fi layer. The runtime refuses to drive while localization is lost. Needs the moving car to validate.
 ### M1. Reuse a saved map: localization mode [SW]
 Load `.lbmap` at start; localize with the likelihood-field matcher against the saved grid (initial guess = dock pose or operator click); keep updating slowly (lower log-odds increments for confirmed cells). Tests: start from a pre-built sim map at a known offset → converge within 0.1 m / 3°.
 ### M2. Static vs dynamic layers + change detection [SW, needs M1]

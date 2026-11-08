@@ -272,3 +272,55 @@ def test_pi_drive_sink_sends_orin_status_with_one_boot_id_per_process(monkeypatc
         assert other.boot_id == mod.BOOT_ID
     finally:
         other.close()
+
+
+def test_orin_run_pi_mode_mission_wiring_over_zeromq(monkeypatch):
+    """tools/orin_run.py --pi-host wiring: Pi scans + MissionRequest in over ZeroMQ, the bridge
+    runs it, MissionStatus comes back out through PiDriveSink (127.0.0.1 ports, no hardware)."""
+    import locatebot.link.transport as transport
+    from locatebot.link.messages import MissionCancel, MissionRequest, MissionStatus
+    from locatebot.orin.missions import MissionBridge
+    mod = _orin_run_module()
+    monkeypatch.setattr(transport, "bind_endpoint", lambda port, interface="*": "tcp://127.0.0.1:*")
+    fake_pi = transport.Publisher("tcp://127.0.0.1:*")
+    monkeypatch.setattr(transport, "pi_pub_endpoint", lambda host=None: fake_pi.endpoint)
+
+    rt = runtime_with_map(5)
+    sink = mod.PiDriveSink(rt)
+    rt.missions = MissionBridge(rt, sink.queue)
+    app = OrinApp(rt, sink)
+    listener = transport.Subscriber(sink.pub.endpoint, ["mission_status"])
+    stop = threading.Event()
+    src = threading.Thread(target=mod.pi_source, args=(app, stop, "ignored", mod.PeerClock()), daemon=True)
+    src.start()
+    rng = np.random.default_rng(5)
+    seq = [100]
+
+    def pump(until, timeout_s=10.0):
+        got, end = [], time.monotonic() + timeout_s
+        while time.monotonic() < end:
+            seq[0] += 1
+            fake_pi.send(simulate_scan(demo_room(), Pose2D(4.0, 3.0, 0.0), rng=rng,
+                                       stamp_s=time.monotonic(), seq=seq[0]))
+            app.step_once()
+            sink(0.0, 0.0)  # drains queued MissionStatus onto the PUB socket
+            got += [m for m in listener.poll(0.03) if isinstance(m, MissionStatus)]
+            if until(got):
+                return got
+        return got
+
+    try:
+        now = time.time()
+        req = MissionRequest("m-1", "marker", now, now + 300)
+        statuses = pump(lambda g: (fake_pi.send(req) or True) and any(s.state == "ACCEPTED" for s in g))
+        assert any(s.mission_id == "m-1" and s.state == "ACCEPTED" for s in statuses), statuses
+        assert rt.goal == "find marker"
+        statuses = pump(lambda g: (fake_pi.send(MissionCancel("m-1", "customer")) or True)
+                        and any(s.state == "CANCELLED" for s in g))
+        assert any(s.mission_id == "m-1" and s.state == "CANCELLED" for s in statuses), statuses
+    finally:
+        stop.set()
+        src.join(3.0)
+        listener.close()
+        sink.close()
+        fake_pi.close()

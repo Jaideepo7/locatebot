@@ -90,6 +90,8 @@ class OrinRuntime:
         self._goal_source = ""
         self._goal_set_s: float | None = None
         self._person_check_until = -math.inf  # M3: low-priority vision "person" check window
+        self._pose_problem_text = ""          # non-empty while the localizer can't be trusted
+        self._pose_lost = False
 
     # ------------------------------------------------------------------ inputs (any thread)
     def on_scan(self, scan: Scan) -> None:
@@ -191,7 +193,17 @@ class OrinRuntime:
             inp = TickInput(now=now, pose=self.mapper.pose, grid=self.mapper.grid_snapshot(),
                             scan=self.mapper.latest_scan, tracker=self.tracker, home=self.mapper.home,
                             people=tuple(self.mapper.people()))
-            out = self.executor.tick(inp)
+            pose_problem = self._pose_problem(now)
+            if pose_problem:
+                # Never steer on a pose the localizer doesn't trust (it is frozen at the last good
+                # value). Lost after being localized: the running skill's plan was built on a pose
+                # that is now wrong, so cancel it. Not localized yet / ambiguous: hold at zero and
+                # don't tick, so a skill sent a moment early starts once the pose is trusted.
+                if self._pose_lost and self.executor.status.state == SkillState.RUNNING:
+                    self.executor.cancel(f"stopped: {pose_problem}")
+                out = DriveOutput()
+            else:
+                out = self.executor.tick(inp)
             st = self.executor.status
             if st.state != self._last_state and st.state in (SkillState.SUCCEEDED, SkillState.FAILED,
                                                              SkillState.CANCELLED) and st.call is not None:
@@ -232,6 +244,28 @@ class OrinRuntime:
                             tracker=self.tracker, home=self.mapper.home)
             return self._world_state(now, inp)
 
+    def _pose_problem(self, now: float) -> str:
+        """Why the pose can't be trusted for driving right now ("" if it can).
+
+        Only saved-map (localizing) mode can lose its pose; a new map's odometry has no such
+        state. Logs one event when the problem starts and one when it clears."""
+        problem = ""
+        self._pose_lost = False
+        if self.mapper.localizing:
+            st = self.mapper.stats()
+            if st.get("lost"):
+                self._pose_lost = True
+                problem = "localization lost: the robot doesn't know where it is in the map"
+            elif not st.get("initialized"):
+                problem = ("localization ambiguous: several places in the map match"
+                           if st.get("ambiguous") else "not localized in the map yet")
+        if problem and problem != self._pose_problem_text:
+            self._event(now, problem + "; holding still (operator: set the pose with /relocalize)")
+        elif not problem and self._pose_problem_text:
+            self._event(now, "localization recovered")
+        self._pose_problem_text = problem
+        return problem
+
     def _world_state(self, now: float, inp: TickInput) -> WorldState:
         call = self.executor.status.call
         search = tuple(call.args.get("items", ())) if call is not None and call.name == SkillName.SEARCH else ()
@@ -240,7 +274,9 @@ class OrinRuntime:
             search_items=search, explored_frac=self.executor.explored_frac,
             safety_reason=self._safety_reason, mission_state=self.executor.status.state.value,
             last_event=self._last_event, goal=self._goal, changes=self.mapper.change_blobs(),
-            people=self.mapper.people(), notes=self.mapper.notes(now))
+            people=self.mapper.people(),
+            notes=([self._pose_problem_text + "; holding still"] if self._pose_problem_text else [])
+            + list(self.mapper.notes(now)))
 
     def _event(self, t: float, text: str) -> None:
         self._events.append((t, text))
