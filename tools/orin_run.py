@@ -35,6 +35,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -117,6 +118,10 @@ def pi_source(app: OrinApp, stop: threading.Event, host: str, clock: PeerClock) 
                     app.runtime.set_safety_reason(msg.safety_reason)
 
 
+# Random per process start; OrinStatus carries it so the Pi resets its drive seq filter after a restart.
+BOOT_ID = uuid.uuid4().hex
+
+
 class PiDriveSink:
     """Publishes drive commands (and Orin status at 1 Hz) on the Orin's PUB socket."""
 
@@ -126,6 +131,7 @@ class PiDriveSink:
         self.runtime = runtime
         self.seq = 0
         self.last_status = 0.0
+        self.boot_id = BOOT_ID
 
     def __call__(self, throttle: float, steering: float) -> None:
         from locatebot.link.messages import DriveCmd, OrinStatus
@@ -136,7 +142,7 @@ class PiDriveSink:
             self.last_status = now
             v = self.runtime.vision.status() if self.runtime.vision is not None else None
             self.pub.send(OrinStatus(now, bool(v and v.get("alive")), v.get("last_latency_s") if v else None,
-                                     self.runtime.executor.status.state.value, None, None))
+                                     self.runtime.executor.status.state.value, None, None, self.boot_id))
 
     def close(self) -> None:
         self.pub.close()

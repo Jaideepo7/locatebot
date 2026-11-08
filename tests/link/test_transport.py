@@ -23,8 +23,12 @@ from locatebot.link.messages import (
     DriveCmd,
     EStopCmd,
     Frame,
+    MissionCancel,
+    MissionRequest,
+    MissionStatus,
     OrinStatus,
     PiStatus,
+    Range,
     encode,
 )
 from locatebot.link.transport import (
@@ -58,7 +62,7 @@ def pi_status(**kw) -> PiStatus:
 
 def orin_status(**kw) -> OrinStatus:
     base = dict(stamp_s=5.0, vision_alive=True, vision_latency_s=2.1, mission_state="explore",
-                cpu_temp_c=None, gpu_temp_c=61.0)
+                cpu_temp_c=None, gpu_temp_c=61.0, boot_id="0123456789abcdef0123456789abcdef")
     base.update(kw)
     return OrinStatus(**base)
 
@@ -136,12 +140,17 @@ ALL_MESSAGES = [
     drive(5),
     estop(6, engage=False),
     orin_status(),
+    Range(stamp_s=12.6, sensor="front_ultrasonic", range_m=None, fov_rad=0.26),
+    MissionRequest(mission_id="m-1", target="blue toolbox", issued_s=1.7e9, expires_s=1.7e9 + 600),
+    MissionCancel(mission_id="m-1", reason="USER_CANCELLED"),
+    MissionStatus(mission_id="m-1", state="SEARCHING", message="Looking for blue toolbox", reason=""),
 ]
 
 
 @pytest.mark.parametrize("transport", ["tcp", "inproc"])
 def test_every_message_type_round_trips(pair, transport):
-    topics = ["scan", "frame", "pi_status", "drive", "estop", "orin_status"]
+    topics = ["scan", "frame", "pi_status", "drive", "estop", "orin_status", "range",
+              "mission_request", "mission_cancel", "mission_status"]
     pub, sub = pair(TCP_ANY if transport == "tcp" else inproc(), topics)
     join(lambda: pub.send(pi_status(stamp_s=-1.0)), lambda t: sub.recv(t) is not None)
     drain(sub)

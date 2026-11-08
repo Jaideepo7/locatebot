@@ -245,3 +245,30 @@ def test_orin_run_sim_with_saved_map_writes_v2(tmp_path):
     assert "updated map:" in p.stdout, p.stdout + p.stderr[-2000:]
     assert (tmp_path / "simroom.v2.lbmap").exists()
     assert mod.map_stem(Path("maps/room.2026.11.08.lbmap")) == Path("maps/room.2026.11.08")
+
+
+def test_pi_drive_sink_sends_orin_status_with_one_boot_id_per_process(monkeypatch):
+    import locatebot.link.transport as transport
+    from locatebot.link.messages import OrinStatus
+    mod = _orin_run_module()
+    monkeypatch.setattr(transport, "bind_endpoint", lambda port, interface="*": "tcp://127.0.0.1:*")
+    rt = runtime_with_map(1)
+    sink = mod.PiDriveSink(rt)
+    sub = transport.Subscriber(sink.pub.endpoint, ["drive", "orin_status"])
+    try:
+        statuses, end = [], time.monotonic() + 5.0
+        while not statuses and time.monotonic() < end:
+            sink.last_status = 0.0  # force a status every call until the subscriber has joined
+            sink(0.0, 0.0)
+            statuses += [m for m in sub.poll(0.05) if isinstance(m, OrinStatus)]
+        assert statuses, "no orin_status received"
+        assert {s.boot_id for s in statuses} == {mod.BOOT_ID}
+        assert len(mod.BOOT_ID) == 32 and int(mod.BOOT_ID, 16) >= 0
+    finally:
+        sub.close()
+        sink.close()
+    other = mod.PiDriveSink(rt)  # a second sink in the same process keeps the boot id
+    try:
+        assert other.boot_id == mod.BOOT_ID
+    finally:
+        other.close()

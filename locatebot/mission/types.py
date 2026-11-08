@@ -22,7 +22,7 @@ class SkillName(str, enum.Enum):
     """The only actions the LLM (or a fallback routine) may request."""
 
     EXPLORE = "explore"          # args: {}  drive to frontiers until the map stops growing
-    SEARCH = "search"            # args: {"items": [str, ...]}  patrol while vision looks for items
+    SEARCH = "search"            # args: {"items": (str, ...)}  patrol while vision looks for items
     GO_TO = "go_to"              # args: {"item": str} or {"x": float, "y": float}  (map frame)
     FOLLOW = "follow"            # args: {"item": str}  keep a set distance behind a tracked item
     LOOK_AROUND = "look_around"  # args: {}  slow turn so the camera sweeps the surroundings
@@ -32,9 +32,11 @@ class SkillName(str, enum.Enum):
 
 # Argument schema per skill: name -> (python type, required). Used to validate LLM tool calls
 # and to generate tool definitions. GO_TO needs either "item" or both "x" and "y".
+# SEARCH items are a tuple in Python (immutable; the LLM sends a JSON array, the tool schema
+# says "array" and ``agent.tools.parse_tool_call`` converts it).
 SKILL_ARGS: dict[SkillName, dict[str, tuple[type, bool]]] = {
     SkillName.EXPLORE: {},
-    SkillName.SEARCH: {"items": (list, True)},
+    SkillName.SEARCH: {"items": (tuple, True)},
     SkillName.GO_TO: {"item": (str, False), "x": (float, False), "y": (float, False)},
     SkillName.FOLLOW: {"item": (str, True)},
     SkillName.LOOK_AROUND: {},
@@ -83,6 +85,41 @@ class ItemView:
 
 
 @dataclass(frozen=True)
+class PersonView:
+    """One tracked person as the agent sees it (from the LiDAR people tracker, ROADMAP M3).
+
+    A LiDAR track is a person only by shape and motion until the camera confirms it, so
+    ``confirmed_by_camera`` tells the LLM how much to trust it.
+    """
+
+    x: float                     # map frame, metres
+    y: float
+    range_m: float               # from the robot's current pose
+    bearing_rad: float           # robot frame, CCW positive (left)
+    speed_mps: float             # estimated ground speed, >= 0
+    moving: bool                 # speed above the tracker's moving threshold
+    confirmed_by_camera: bool    # a vision "person" fix matched this track
+    last_seen_age_s: float       # time since the LiDAR last associated a detection
+
+
+@dataclass(frozen=True)
+class ChangeView:
+    """Something new or moved compared with the saved room map (ROADMAP M2 change detection).
+
+    Not classified: it may be a bag, a moved chair or a person (people also appear in
+    ``WorldState.people`` once tracked).
+    """
+
+    x: float                     # map frame, metres (blob centroid)
+    y: float
+    width_m: float               # blob extent across the LiDAR's view
+    range_m: float               # from the robot's current pose
+    bearing_rad: float           # robot frame, CCW positive (left)
+    moving: bool                 # the blob moved since it was first seen
+    age_s: float                 # time since it was first seen
+
+
+@dataclass(frozen=True)
 class WorldState:
     """Snapshot handed to the LLM agent. Built on the Orin from pose, scan, map, items, skill."""
 
@@ -98,6 +135,12 @@ class WorldState:
     safety_reason: str = "ok"    # last Pi safety Reason value
     mission_state: str = "idle"
     last_event: str = ""         # newest notable event, e.g. "found marker", "blocked"
+    goal: str = ""               # the operator's / Telegram request in words, "" = no goal
+    people: tuple[PersonView, ...] = ()   # nearest first
+    changes: tuple[ChangeView, ...] = ()  # new/moved things vs the saved room map, nearest first
+    # Short extra facts for the LLM, e.g. "glass or low obstacle 0.6 m ahead (ultrasonic only)",
+    # "wifi weak here". Producers keep each note short and the tuple small.
+    notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

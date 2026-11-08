@@ -13,11 +13,20 @@ from locatebot.link.messages import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     DriveCmd,
+    MAX_ID_CHARS,
+    MAX_MESSAGE_CHARS,
+    MAX_REASON_CHARS,
+    MAX_TARGET_CHARS,
+    MISSION_STATES,
     EStopCmd,
     Frame,
+    MissionCancel,
+    MissionRequest,
+    MissionStatus,
     OrinStatus,
     PiStatus,
     ProtocolError,
+    Range,
     decode,
     encode,
 )
@@ -42,7 +51,13 @@ def pi_status(**kw):
     (EStopCmd(True, seq=1, sent_s=1.0), b"estop"),
     (pi_status(), b"pi_status"),
     (OrinStatus(stamp_s=1.0, vision_alive=True, vision_latency_s=2.5, mission_state="SEARCHING",
-                cpu_temp_c=50.0, gpu_temp_c=None), b"orin_status"),
+                cpu_temp_c=50.0, gpu_temp_c=None, boot_id="b007"), b"orin_status"),
+    (Range(stamp_s=2.0, sensor="front_ultrasonic", range_m=0.6, fov_rad=0.26), b"range"),
+    (MissionRequest(mission_id="m-1", target="blue toolbox", issued_s=1.7e9, expires_s=1.7e9 + 600),
+     b"mission_request"),
+    (MissionCancel(mission_id="m-1", reason="USER_CANCELLED"), b"mission_cancel"),
+    (MissionStatus(mission_id="m-1", state="SEARCHING", message="Looking for blue toolbox", reason=""),
+     b"mission_status"),
 ])
 def test_encode_is_three_frames_topic_header_payload(msg, topic):
     parts = encode(msg)
@@ -211,3 +226,202 @@ def test_encode_rejects_non_finite_times():
         encode(Frame(b"x", capture_s=float("nan"), seq=1))
     with pytest.raises(ProtocolError):
         encode(DriveCmd(0.1, 0.0, seq=1, sent_s=float("inf")))
+
+
+# --- Step C contracts: range, missions, boot_id -------------------------------------
+
+def orin_status(**kw):
+    base = dict(stamp_s=1.0, vision_alive=False, vision_latency_s=None, mission_state="idle",
+                cpu_temp_c=None, gpu_temp_c=None, boot_id="3f2a" * 8)
+    base.update(kw)
+    return OrinStatus(**base)
+
+
+def rng(**kw):
+    base = dict(stamp_s=5.0, sensor="front_ultrasonic", range_m=0.6, fov_rad=0.26)
+    base.update(kw)
+    return Range(**base)
+
+
+def request(**kw):
+    base = dict(mission_id="5b0c1f0e-1d2a-4b8e-9f00-123456789abc", target="blue toolbox",
+                issued_s=1_762_600_000.0, expires_s=1_762_600_600.0)
+    base.update(kw)
+    return MissionRequest(**base)
+
+
+def status(**kw):
+    base = dict(mission_id="m-1", state="ACCEPTED", message="On it", reason="")
+    base.update(kw)
+    return MissionStatus(**base)
+
+
+def cancel(**kw):
+    base = dict(mission_id="m-1", reason="")
+    base.update(kw)
+    return MissionCancel(**base)
+
+
+def _forged(msg, **changes):
+    """Encode ``msg`` and edit its JSON header, to test what decode accepts."""
+    parts = encode(msg)
+    hdr = json.loads(parts[1])
+    for k, v in changes.items():
+        if v is _DROP:
+            del hdr[k]
+        else:
+            hdr[k] = v
+    return [parts[0], json.dumps(hdr).encode(), parts[2]]
+
+
+_DROP = object()
+
+
+def test_orin_status_carries_boot_id():
+    s = orin_status()
+    out = decode(encode(s))
+    assert out.boot_id == "3f2a" * 8 and out == s
+    with pytest.raises(ProtocolError, match="boot_id"):
+        decode(_forged(s, boot_id=_DROP))
+    for bad in ("", "  ", "x" * (MAX_ID_CHARS + 1), "a\nb"):
+        with pytest.raises(ProtocolError):
+            encode(orin_status(boot_id=bad))
+        with pytest.raises(ProtocolError):
+            decode(_forged(s, boot_id=bad))
+
+
+def test_boot_id_is_required_by_the_dataclass():
+    with pytest.raises(TypeError):
+        OrinStatus(1.0, True, None, "idle", None, None)  # noqa - old 6-field call must not pass silently
+
+
+@pytest.mark.parametrize("msg", [
+    rng(), rng(range_m=None), rng(range_m=0.0), rng(fov_rad=math.pi),
+    request(), request(target="x" * MAX_TARGET_CHARS),
+    cancel(), cancel(reason="USER_CANCELLED"), cancel(mission_id="i" * MAX_ID_CHARS),
+    status(message="", reason=""), status(message="m" * MAX_MESSAGE_CHARS, reason="r" * MAX_REASON_CHARS),
+    status(message="Found the blue toolbox at (1.2, -0.4) \u2014 approaching", state="TARGET_DETECTED"),
+])
+def test_new_messages_round_trip(msg):
+    parts = encode(msg)
+    assert parts[2] == b""
+    assert json.loads(parts[1])["type"] == parts[0].decode()
+    assert decode(parts) == msg
+
+
+@pytest.mark.parametrize("state", MISSION_STATES)
+def test_every_mission_state_round_trips(state):
+    assert decode(encode(status(state=state))).state == state
+
+
+def test_mission_states_are_the_protocol_list():
+    assert MISSION_STATES == ("PENDING", "ACCEPTED", "SEARCHING", "TARGET_DETECTED", "APPROACHING",
+                              "COMPLETED", "FAILED", "CANCELLED")
+
+
+@pytest.mark.parametrize("state", ["", "searching", "DONE", "SEARCHING ", 3, None])
+def test_wrong_mission_state_rejected_on_encode_and_decode(state):
+    with pytest.raises(ProtocolError):
+        encode(status(state=state))
+    with pytest.raises(ProtocolError):
+        decode(_forged(status(), state=state))
+
+
+def test_range_no_echo_is_null_and_nan_becomes_null():
+    parts = encode(rng(range_m=None))
+    assert json.loads(parts[1])["range_m"] is None
+    assert decode(encode(rng(range_m=math.nan))).range_m is None
+
+
+@pytest.mark.parametrize("kw", [dict(range_m=-0.1), dict(fov_rad=0.0), dict(fov_rad=-0.2), dict(fov_rad=4.0),
+                                dict(fov_rad=math.nan), dict(stamp_s=math.inf), dict(sensor=""),
+                                dict(sensor="s" * (MAX_ID_CHARS + 1))])
+def test_bad_range_rejected_on_both_sides(kw):
+    with pytest.raises(ProtocolError):
+        encode(rng(**kw))
+    wire = {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in kw.items()}
+    with pytest.raises(ProtocolError):
+        decode(_forged(rng(), **wire))
+
+
+@pytest.mark.parametrize("msg,field,limit", [
+    (request(), "target", MAX_TARGET_CHARS),
+    (request(), "mission_id", MAX_ID_CHARS),
+    (status(), "message", MAX_MESSAGE_CHARS),
+    (status(), "reason", MAX_REASON_CHARS),
+    (status(), "mission_id", MAX_ID_CHARS),
+    (cancel(), "reason", MAX_REASON_CHARS),
+    (cancel(), "mission_id", MAX_ID_CHARS),
+])
+def test_string_limits(msg, field, limit):
+    import dataclasses
+    ok = dataclasses.replace(msg, **{field: "a" * limit})
+    assert decode(encode(ok)) == ok
+    long = dataclasses.replace(msg, **{field: "a" * (limit + 1)})
+    with pytest.raises(ProtocolError, match="longer"):
+        encode(long)
+    with pytest.raises(ProtocolError, match="longer"):
+        decode(_forged(msg, **{field: "a" * (limit + 1)}))
+
+
+@pytest.mark.parametrize("bad", ["a\x00b", "line\nbreak", "tab\there", "del\x7f", "c1\x85"])
+@pytest.mark.parametrize("msg,field", [
+    (request(), "target"), (request(), "mission_id"), (status(), "message"), (status(), "reason"),
+    (cancel(), "reason"), (rng(), "sensor"),
+])
+def test_control_characters_rejected(msg, field, bad):
+    import dataclasses
+    with pytest.raises(ProtocolError, match="control"):
+        encode(dataclasses.replace(msg, **{field: bad}))
+    with pytest.raises(ProtocolError, match="control"):
+        decode(_forged(msg, **{field: bad}))
+
+
+@pytest.mark.parametrize("msg,field", [
+    (request(), "target"), (request(), "mission_id"), (status(), "mission_id"), (cancel(), "mission_id"),
+])
+def test_required_strings_must_not_be_blank(msg, field):
+    import dataclasses
+    for blank in ("", "   "):
+        with pytest.raises(ProtocolError, match="empty"):
+            encode(dataclasses.replace(msg, **{field: blank}))
+        with pytest.raises(ProtocolError, match="empty"):
+            decode(_forged(msg, **{field: blank}))
+
+
+@pytest.mark.parametrize("msg", [rng(), request(), cancel(), status(), orin_status()])
+def test_new_messages_missing_field_rejected(msg):
+    import dataclasses
+    for f in dataclasses.fields(msg):
+        with pytest.raises(ProtocolError, match="missing"):
+            decode(_forged(msg, **{f.name: _DROP}))
+
+
+@pytest.mark.parametrize("msg", [rng(), request(), cancel(), status(), orin_status()])
+def test_new_messages_ignore_extra_fields(msg):
+    assert decode(_forged(msg, priority=5, note="from a newer sender")) == msg
+
+
+@pytest.mark.parametrize("msg,field,value", [
+    (request(), "target", 5), (request(), "issued_s", "soon"), (request(), "expires_s", None),
+    (request(), "issued_s", True), (cancel(), "reason", None), (status(), "message", ["x"]),
+    (rng(), "range_m", "far"), (rng(), "fov_rad", None), (orin_status(), "boot_id", 7),
+])
+def test_new_messages_wrong_types_rejected(msg, field, value):
+    with pytest.raises(ProtocolError):
+        decode(_forged(msg, **{field: value}))
+
+
+def test_new_messages_reject_payload_and_topic_mismatch():
+    parts = encode(request())
+    with pytest.raises(ProtocolError, match="payload"):
+        decode([parts[0], parts[1], b"junk"])
+    with pytest.raises(ProtocolError):
+        decode([b"mission_status", parts[1], parts[2]])
+
+
+def test_mission_times_must_be_finite():
+    with pytest.raises(ProtocolError):
+        encode(request(expires_s=math.inf))
+    with pytest.raises(ProtocolError):
+        decode(_forged(request(), issued_s=None))
