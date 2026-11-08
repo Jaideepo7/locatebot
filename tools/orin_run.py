@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import math
 import signal
 import sys
@@ -264,6 +265,12 @@ def main(argv=None) -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--maps-dir", default=str(ROOT / "maps"))
+    ap.add_argument("--db", default=os.environ.get("LOCATEBOT_DB_URL"),
+                    help="PostgreSQL URL for shared storage (photos, items, events, missions, maps), "
+                         "e.g. postgresql://locatebot@<pi-address>/locatebot; default $LOCATEBOT_DB_URL; "
+                         "password from ~/.pgpass or $PGPASSWORD, never on the command line")
+    ap.add_argument("--spool-dir", default=str(ROOT / "spool"),
+                    help="where storage writes wait while the database is unreachable")
     ap.add_argument("--seconds", type=float, help="stop after this long")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
@@ -273,6 +280,16 @@ def main(argv=None) -> int:
     vehicle = VehicleConfig()
     clock = PeerClock() if args.pi_host else time.monotonic
     runtime = OrinRuntime(make_mapper(ap, args), SkillExecutor(vehicle), clock=clock)
+    photo_db = None
+    if args.db:  # never blocks the robot: writes queue, and spool to disk while the DB is down
+        from locatebot.storage.reader import DBReader
+        from locatebot.storage.recorder import StorageRecorder
+        runtime.recorder = StorageRecorder(args.db, args.spool_dir)
+        runtime.recorder.start_session(map_name=Path(args.map).stem if getattr(args, "map", None) else "",
+                                       meta={"llm": args.llm, "mode": args.mode, "source":
+                                             "sim" if args.sim else ("pi" if args.pi_host else "lidar")})
+        runtime.recorder.start()
+        photo_db = DBReader(args.db)
 
     llm = make_llm(args)
     if llm is not None:
@@ -291,10 +308,18 @@ def main(argv=None) -> int:
 
     sim = SimSource(vehicle) if args.sim else None
     sink = sim.drive if sim else (PiDriveSink(runtime) if args.pi_host else DryRunSink())
-    app = OrinApp(runtime, sink, clock=clock, config=AppConfig(maps_dir=args.maps_dir))
+    app = OrinApp(runtime, sink, clock=clock, config=AppConfig(maps_dir=args.maps_dir), photo_db=photo_db)
     if args.pi_host:  # Telegram/operator missions from the Pi (docs/remote/README.md)
         from locatebot.orin.missions import MissionBridge
-        runtime.missions = MissionBridge(runtime, sink.queue)
+        publish = sink.queue
+        if runtime.recorder is not None:
+            def publish(msg, _queue=sink.queue, _rec=runtime.recorder):
+                _queue(msg)
+                try:
+                    _rec.mission(msg.mission_id, msg.state, msg.message, msg.reason)
+                except Exception as e:  # noqa: BLE001 - storage never blocks a mission
+                    log.warning("mission status not stored: %s", e)
+        runtime.missions = MissionBridge(runtime, publish)
 
     stop = threading.Event()
     if sim:
@@ -337,6 +362,11 @@ def main(argv=None) -> int:
         if hasattr(sink, "close"):
             sink.close()
         save_localized_map(args, runtime.mapper)
+        if runtime.recorder is not None:
+            runtime.recorder.stop(timeout=5.0)   # what isn't written stays in --spool-dir for next time
+            print(f"storage: {runtime.recorder.status()}", flush=True)
+        if photo_db is not None:
+            photo_db.close()
         st = app.status()
         print(f"stopped: {st['map']['integrated']} scans mapped, skill {st['skill']['state']}"
               f" ({st['skill']['detail'] or '-'}), max step {st['app']['max_step_ms']} ms", flush=True)
