@@ -20,7 +20,9 @@ room instead of the last few keyframes, so the pose does not drift).
 
 ``LocalizingMapper`` is the ``Mapper`` counterpart for a saved map: it localizes every scan and
 integrates it with ``OccupancyGrid.integrate_slow`` (damped increments for confident cells) only
-when the pose came from a converged, unambiguous map match.
+when the pose came from a converged, unambiguous map match. With ``layered=True`` (M2) the
+update goes through ``layers.LayeredMap`` instead: new/moving things go to a short-lived dynamic
+layer and never into the room map.
 
 Tests use synthetic rooms (``locatebot.lidar.sim``): they prove software behaviour, not
 real-sensor behaviour. Real recordings can be replayed with ``tools/relocalize.py``.
@@ -37,7 +39,8 @@ import numpy as np
 
 from .detect import clean_scan
 from .grid import FREE, OCCUPIED, OccupancyGrid
-from .mapfile import export_ros_map, load_map, save_map
+from .layers import LayeredMap, LayersConfig
+from .mapfile import export_ros_map, load_map_layers, save_map
 from .matching import LikelihoodField, _score_grid, _subsample, match_scan
 from .types import RANGE_MAX_M, Pose2D, Scan, wrap_angle
 
@@ -425,8 +428,14 @@ class LocalizingMapper:
 
     def __init__(self, grid: OccupancyGrid, meta: dict | None = None, guess: Pose2D | None = None,
                  config: LocalizerConfig | None = None, slow_rate: float = 0.2,
-                 max_range_m: float = RANGE_MAX_M, rebuild_check_every: int = 25) -> None:
+                 max_range_m: float = RANGE_MAX_M, rebuild_check_every: int = 25,
+                 layered: bool = False, layers_config: LayersConfig | None = None,
+                 extra_layers: dict | None = None) -> None:
         self.grid = grid
+        self.layers: LayeredMap | None = None
+        if layered:
+            lc = layers_config or LayersConfig(slow_rate=slow_rate, max_range_m=max_range_m)
+            self.layers = LayeredMap(grid, lc, extra=extra_layers)
         self.meta = dict(meta or {})
         self.localizer = MapLocalizer(grid, config, guess=guess)
         self.slow_rate = float(slow_rate)
@@ -442,7 +451,9 @@ class LocalizingMapper:
 
     @classmethod
     def from_file(cls, path, guess: Pose2D | None = None, **kw) -> "LocalizingMapper":
-        grid, meta = load_map(path)
+        grid, meta, extra = load_map_layers(path)
+        if kw.get("layered"):
+            kw.setdefault("extra_layers", extra)
         return cls(grid, meta, guess=guess, **kw)
 
     def add_scan(self, scan: Scan) -> LocalizeResult:
@@ -454,12 +465,19 @@ class LocalizingMapper:
             p = res.pose
             self.trajectory.append((cleaned.stamp_s, p.x, p.y, p.theta))
             if res.source in ("map", "init"):
-                self.grid.integrate_slow(cleaned, p, rate=self.slow_rate, max_range_m=self.max_range_m)
+                if self.layers is not None:
+                    self.layers.update(cleaned, p, cleaned.stamp_s)
+                else:
+                    self.grid.integrate_slow(cleaned, p, rate=self.slow_rate, max_range_m=self.max_range_m)
                 self.n_integrated += 1
                 if self.n_integrated % self.rebuild_check_every == 0 and self.localizer.maybe_rebuild(self.grid):
                     self.n_rebuilds += 1
+            elif self.layers is not None:  # odometry-fallback pose: track changes, keep the room
+                self.layers.update(cleaned, p, cleaned.stamp_s, integrate_static=False)
         else:
             self.n_rejected += 1
+            if self.layers is not None:
+                self.layers.decay(cleaned.stamp_s)
         return res
 
     def save(self, stem: str | Path, meta: dict | None = None) -> dict[str, Path]:
@@ -480,7 +498,8 @@ class LocalizingMapper:
                              "slow_rate": self.slow_rate},
         })
         paths = {k: stem.with_name(stem.name + "." + k) for k in ("lbmap", "pgm", "yaml")}
-        save_map(paths["lbmap"], self.grid, full)
+        save_map(paths["lbmap"], self.grid, full,
+                 layers=self.layers.save_layers() if self.layers is not None else None)
         export_ros_map(self.grid, paths["pgm"], paths["yaml"])
         return paths
 

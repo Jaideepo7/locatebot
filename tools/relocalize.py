@@ -9,7 +9,8 @@ Without --guess the localizer starts from the map's home pose (where mapping sta
 --global it starts with no guess at all (search over every FREE cell and heading). Prints the
 pose track every --every scans, every lost / ambiguous / recovery / odometry-fallback event,
 and a summary (scores, pose spread, timing). The map file is never modified; --out writes the
-slowly updated map to a new stem.
+slowly updated map to a new stem. --layered also runs M2 change detection (static/dynamic
+layers) and reports how many new/moving things it saw.
 """
 from __future__ import annotations
 
@@ -38,8 +39,10 @@ def parse_pose(text: str) -> Pose2D:
 
 
 def run(map_path, log_path, guess: Pose2D | None, use_global: bool, every: int, out=None,
-        config: LocalizerConfig | None = None, quiet: bool = False) -> dict:
-    lm = LocalizingMapper.from_file(map_path, guess=guess, config=config)
+        config: LocalizerConfig | None = None, quiet: bool = False, layered: bool = False) -> dict:
+    lm = LocalizingMapper.from_file(map_path, guess=guess, config=config, layered=layered)
+    blob_ids: set[int] = set()
+    max_blobs = 0
     if guess is None and not use_global:
         lm.localizer.request_init(lm.home)
     elif use_global:
@@ -64,6 +67,10 @@ def run(map_path, log_path, guess: Pose2D | None, use_global: bool, every: int, 
             say(f"event  scan {i:5d}  {state:10s} score {r.score:.3f}"
                 + (f"  runner-up {ev['runner_up']}" if "runner_up" in ev else ""))
         prev = state
+        if lm.layers is not None:
+            bl = lm.layers.blobs()
+            blob_ids |= {b.id for b in bl}
+            max_blobs = max(max_blobs, len(bl))
         if every and i % every == 0:
             p = r.pose
             say(f"scan {i:5d}  t {scan.stamp_s:10.3f}  pose ({p.x:7.3f}, {p.y:7.3f}, {math.degrees(p.theta):7.2f} deg)"
@@ -85,6 +92,10 @@ def run(map_path, log_path, guess: Pose2D | None, use_global: bool, every: int, 
         summary.update({"init_ms": round(times[0] * 1e3, 1), "update_ms_p50": round(float(np.median(t)), 1),
                         "update_ms_p95": round(float(np.percentile(t, 95)), 1),
                         "update_ms_max": round(float(t.max()), 1)})
+    if lm.layers is not None:
+        summary["changes"] = {"blobs_seen": len(blob_ids), "max_at_once": max_blobs,
+                              "now": [{"xy": [round(v, 2) for v in b.centroid_xy], "width_m": round(b.width_m, 2),
+                                       "scans": b.persistence, "moving": b.moving} for b in lm.layers.blobs()]}
     if out is not None:
         summary["files"] = {k: str(v) for k, v in lm.save(out, meta={"relocalize_log": str(log_path)}).items()}
     return summary
@@ -98,8 +109,9 @@ def main(argv=None) -> int:
     ap.add_argument("--global", dest="use_global", action="store_true", help="no guess: global search")
     ap.add_argument("--every", type=int, default=10, help="print the pose every N scans (0: events only)")
     ap.add_argument("--out", type=Path, help="write the slowly updated map to this stem")
+    ap.add_argument("--layered", action="store_true", help="M2 static/dynamic layers + change detection")
     args = ap.parse_args(argv)
-    summary = run(args.map, args.log, args.guess, args.use_global, args.every, args.out)
+    summary = run(args.map, args.log, args.guess, args.use_global, args.every, args.out, layered=args.layered)
     print(json.dumps(summary, indent=2))
     return 0
 

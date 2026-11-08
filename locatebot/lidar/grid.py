@@ -139,8 +139,14 @@ class OccupancyGrid:
         masks = self.ray_masks(scan, pose, max_range_m, beam_mask)
         if masks is None:
             return
-        free, occ = masks
+        self.apply_slow(masks[0], masks[1], rate, confident_abs)
+
+    def apply_slow(self, free: np.ndarray, occ: np.ndarray, rate: float = 0.2,
+                   confident_abs: float = 1.5) -> None:
+        """The update step of ``integrate_slow`` for precomputed flat (H*W,) ``free``/``occ`` masks
+        (disjoint; ``occ`` wins). Used by the layered map, which decides per beam what to integrate."""
         lo = self.log_odds.reshape(-1)  # view
+        free = free & ~occ
         touched = free | occ
         scale = np.where(np.abs(lo[touched]) >= confident_abs, np.float32(rate), np.float32(1.0))
         inc = np.where(occ[touched], np.float32(self.l_occ), np.float32(self.l_free)) * scale
