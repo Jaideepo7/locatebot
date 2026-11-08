@@ -325,7 +325,7 @@ class OpenAICompatClient:
 
     def _body(self, messages: list[dict], tools: list[dict] | None, max_tokens: int | None) -> dict:
         body: dict[str, Any] = {"model": self.model, "messages": messages, "stream": False}
-        if tools:
+        if tools is not None:  # decide() always sends tools; chat() sends none when it has none
             body["tools"] = [
                 {"type": "function", "function": {
                     "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
@@ -417,7 +417,7 @@ class OpenAICompatClient:
         Raises ``LLMTruncated`` when the reply hit the token limit.
         """
         headers = self._headers()
-        body = self._body(messages, tools, max_tokens)
+        body = self._body(messages, tools or None, max_tokens)
         return self._parse_chat(post_json(self.url, headers, body, timeout_s))
 
 

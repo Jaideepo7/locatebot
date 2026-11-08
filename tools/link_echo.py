@@ -19,7 +19,8 @@ from locatebot.lidar.types import Scan  # noqa: E402
 from locatebot.link.messages import Frame  # noqa: E402
 from locatebot.link.transport import Subscriber  # noqa: E402
 
-ALL_TOPICS = ["scan", "frame", "pi_status", "drive", "estop", "orin_status"]
+ALL_TOPICS = ["scan", "frame", "pi_status", "range", "mission_request", "mission_cancel",
+              "drive", "estop", "orin_status", "mission_status"]
 
 
 def describe(msg) -> str:

@@ -9,12 +9,17 @@ Sources (pick one):
 LLM (optional):
   --llm none     operator only: send skills from the page (default)
   --llm claude   Anthropic API, key from the ANTHROPIC_API_KEY env var (needs internet)
-  --llm nemotron NVIDIA-hosted Nemotron, key from the NVIDIA_API_KEY env var (needs internet;
-                 load it with: set -a; source .env; set +a)
   --llm local    OpenAI-compatible server, e.g. Ollama: --llm-url http://127.0.0.1:11434/v1 --llm-model <m>
+  --llm nemotron NVIDIA API (OpenAI-compatible, https://integrate.api.nvidia.com/v1), key from the
+                 NVIDIA_API_KEY env var; thinking off. --llm-model defaults to
+                 nvidia/nemotron-3.5-super-vl-120b-a12b (load the key: set -a; source .env; set +a)
   --mode approve (default): the operator approves each LLM call on the page; --mode auto runs them.
 
 Vision (optional, needs camera frames, i.e. --pi-host): --vision [--model ... --lib ...]
+
+Saved map (optional): --map maps/<name>.lbmap [--start-pose x,y,deg] [--save-map]
+  localizes in the saved map instead of starting a new one (no --start-pose: global search),
+  updates it slowly and on exit writes maps/<name>.v2.lbmap (--save-map: overwrites <name>.lbmap).
 
 Examples
   python tools/orin_run.py --sim --port 8090
@@ -31,6 +36,8 @@ import signal
 import sys
 import threading
 import time
+import uuid
+from collections import deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,11 +106,14 @@ def lidar_source(app: OrinApp, stop: threading.Event, port: str, baud: int, moun
 
 def pi_source(app: OrinApp, stop: threading.Event, host: str, clock: PeerClock) -> None:
     from locatebot.lidar.types import Scan
-    from locatebot.link.messages import Frame, PiStatus
+    from locatebot.link.messages import Frame, PiStatus, Range
     from locatebot.link.transport import Subscriber, pi_pub_endpoint
-    with Subscriber(pi_pub_endpoint(host), ["scan", "frame", "pi_status"], newest_only=("frame",)) as sub:
+    topics = ["scan", "frame", "pi_status", "range", "mission_request", "mission_cancel"]  # missions: never newest-only
+    with Subscriber(pi_pub_endpoint(host), topics, newest_only=("frame",)) as sub:
         while not stop.is_set():
             for msg in sub.poll(0.2):
+                if app.runtime.missions is not None and app.runtime.missions.on_message(msg):
+                    continue
                 if isinstance(msg, Scan):
                     clock.observe(msg.stamp_s)
                     app.on_scan(msg)
@@ -111,6 +121,12 @@ def pi_source(app: OrinApp, stop: threading.Event, host: str, clock: PeerClock) 
                     app.on_frame(msg.jpeg, msg.capture_s)
                 elif isinstance(msg, PiStatus):
                     app.runtime.set_safety_reason(msg.safety_reason)
+                elif isinstance(msg, Range):  # M3: ultrasonic -> glass_or_low layer (saved-map mode)
+                    app.runtime.on_range(msg)
+
+
+# Random per process start; OrinStatus carries it so the Pi resets its drive seq filter after a restart.
+BOOT_ID = uuid.uuid4().hex
 
 
 class PiDriveSink:
@@ -122,17 +138,25 @@ class PiDriveSink:
         self.runtime = runtime
         self.seq = 0
         self.last_status = 0.0
+        self.boot_id = BOOT_ID
+        self._queue = deque()  # MissionStatus from the control thread; only this sink's thread sends
+
+    def queue(self, msg) -> None:
+        """Thread-safe: hand a message (e.g. MissionStatus) to the sender thread."""
+        self._queue.append(msg)
 
     def __call__(self, throttle: float, steering: float) -> None:
         from locatebot.link.messages import DriveCmd, OrinStatus
         self.seq += 1
         self.pub.send(DriveCmd(float(throttle), float(steering), self.seq, time.monotonic()))
+        while self._queue:
+            self.pub.send(self._queue.popleft())
         now = time.monotonic()
         if now - self.last_status >= 1.0:
             self.last_status = now
             v = self.runtime.vision.status() if self.runtime.vision is not None else None
             self.pub.send(OrinStatus(now, bool(v and v.get("alive")), v.get("last_latency_s") if v else None,
-                                     self.runtime.executor.status.state.value, None, None))
+                                     self.runtime.executor.status.state.value, None, None, self.boot_id))
 
     def close(self) -> None:
         self.pub.close()
@@ -159,8 +183,61 @@ def make_llm(args):
     if args.llm == "claude":
         return ClaudeClient(model=args.llm_model) if args.llm_model else ClaudeClient()
     if args.llm == "nemotron":
-        return NemotronClient(model=args.llm_model) if args.llm_model else NemotronClient()
-    return OpenAICompatClient(base_url=args.llm_url, model=args.llm_model or "qwen2.5:7b-instruct")
+        # thinking off, one tool call per reply, key from NVIDIA_API_KEY (see locatebot/agent/llm.py)
+        kw = {"base_url": args.llm_url} if args.llm_url else {}
+        return NemotronClient(model=args.llm_model, **kw) if args.llm_model else NemotronClient(**kw)
+    return OpenAICompatClient(base_url=args.llm_url or "http://127.0.0.1:11434/v1",
+                              model=args.llm_model or "qwen2.5:7b-instruct")
+
+
+def parse_pose(text: str) -> Pose2D:
+    x, y, deg = (float(v) for v in text.split(","))
+    return Pose2D(x, y, math.radians(deg))
+
+
+def make_mapper(ap, args) -> LiveMapper:
+    if args.map is None:
+        if args.start_pose or args.save_map:
+            ap.error("--start-pose/--save-map need --map")
+        return LiveMapper(size_m=args.map_size)
+    try:
+        guess = parse_pose(args.start_pose) if args.start_pose else None
+    except ValueError:
+        ap.error("--start-pose must be x,y,deg")
+    lm = LiveMapper.from_saved(args.map, guess=guess)
+    log.info("localizing in %s (%s)", args.map, "global search" if guess is None else f"guess {guess}")
+    return lm
+
+
+def wifi_source(mapper: LiveMapper, stop: threading.Event, clock, iface: str | None = None) -> None:
+    """M3: 1 Hz Wi-Fi RSSI into the wifi_rssi layer (saved-map mode). No Wi-Fi tool: disabled."""
+    from locatebot.orin.wifi import WifiReader
+    reader = WifiReader(iface)
+    if not reader.enabled:
+        log.info("wifi layer disabled: no /proc/net/wireless interface and no iw")
+        return
+    log.info("wifi layer: %s via %s", reader.iface, reader.mode)
+    while not stop.wait(1.0):
+        mapper.add_wifi(reader.read(), clock())
+
+
+def map_stem(path: Path) -> Path:
+    name = path.name[:-len(".lbmap")] if path.name.endswith(".lbmap") else path.name
+    return path.with_name(name)
+
+
+def save_localized_map(args, mapper: LiveMapper) -> None:
+    """--map sessions: keep the slowly updated map (never when it never localized)."""
+    if args.map is None:
+        return
+    st = mapper.stats()
+    if not st.get("integrated"):
+        print("map not saved: never localized", flush=True)
+        return
+    stem = map_stem(args.map)
+    stem = stem if args.save_map else stem.with_name(stem.name + ".v2")
+    paths = mapper.save(stem, meta={"saved_by": "orin_run"})
+    print(f"updated map: {paths['lbmap']}", flush=True)
 
 
 def main(argv=None) -> int:
@@ -171,15 +248,19 @@ def main(argv=None) -> int:
     src.add_argument("--pi-host")
     ap.add_argument("--baud", type=int, default=460800)
     ap.add_argument("--mount-offset-deg", type=float, default=0.0)
-    ap.add_argument("--llm", choices=["none", "claude", "nemotron", "local"], default="none")
+    ap.add_argument("--llm", choices=["none", "claude", "local", "nemotron"], default="none")
     ap.add_argument("--llm-model")
-    ap.add_argument("--llm-url", default="http://127.0.0.1:11434/v1")
+    ap.add_argument("--llm-url", help="override the server URL (local: Ollama default; nemotron: NVIDIA API)")
     ap.add_argument("--mode", choices=["approve", "auto"], default="approve")
     ap.add_argument("--vision", action="store_true", help="run LocateAnything on frames from the Pi")
     ap.add_argument("--model", type=Path, default=ROOT / "models" / "locate-anything-q4_k.gguf")
     ap.add_argument("--lib", type=Path)
     ap.add_argument("--hfov-deg", type=float, default=70.0, help="camera horizontal field of view")
     ap.add_argument("--map-size", type=float, default=20.0)
+    ap.add_argument("--map", type=Path, help="saved .lbmap to localize in (instead of a new map)")
+    ap.add_argument("--start-pose", help="with --map: where the car is in that map, x,y,deg")
+    ap.add_argument("--save-map", action="store_true", help="with --map: overwrite it on exit")
+    ap.add_argument("--wifi-iface", help="with --map: Wi-Fi interface for the coverage layer (default: auto)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--maps-dir", default=str(ROOT / "maps"))
@@ -191,7 +272,7 @@ def main(argv=None) -> int:
 
     vehicle = VehicleConfig()
     clock = PeerClock() if args.pi_host else time.monotonic
-    runtime = OrinRuntime(LiveMapper(size_m=args.map_size), SkillExecutor(vehicle), clock=clock)
+    runtime = OrinRuntime(make_mapper(ap, args), SkillExecutor(vehicle), clock=clock)
 
     llm = make_llm(args)
     if llm is not None:
@@ -211,6 +292,9 @@ def main(argv=None) -> int:
     sim = SimSource(vehicle) if args.sim else None
     sink = sim.drive if sim else (PiDriveSink(runtime) if args.pi_host else DryRunSink())
     app = OrinApp(runtime, sink, clock=clock, config=AppConfig(maps_dir=args.maps_dir))
+    if args.pi_host:  # Telegram/operator missions from the Pi (docs/remote/README.md)
+        from locatebot.orin.missions import MissionBridge
+        runtime.missions = MissionBridge(runtime, sink.queue)
 
     stop = threading.Event()
     if sim:
@@ -230,6 +314,9 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     source.start()
+    if args.map is not None and not args.sim:
+        threading.Thread(target=wifi_source, args=(runtime.mapper, stop, clock, args.wifi_iface),
+                         name="wifi", daemon=True).start()
     app.start()
     web.start()
     host, port = server.server_address[:2]
@@ -249,6 +336,7 @@ def main(argv=None) -> int:
             runtime.vision.stop(timeout=2.0)
         if hasattr(sink, "close"):
             sink.close()
+        save_localized_map(args, runtime.mapper)
         st = app.status()
         print(f"stopped: {st['map']['integrated']} scans mapped, skill {st['skill']['state']}"
               f" ({st['skill']['detail'] or '-'}), max step {st['app']['max_step_ms']} ms", flush=True)

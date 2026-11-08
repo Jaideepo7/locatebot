@@ -309,7 +309,7 @@ def test_bad_config():
 
 
 # ---------------------------------------------------------------- "continue": keep the running skill
-SEARCH = SkillCall(SkillName.SEARCH, {"items": ["marker", "bolt"]}, "", "llm")
+SEARCH = SkillCall(SkillName.SEARCH, {"items": ("marker", "bolt")}, "", "llm")  # as parse_tool_call stores it
 
 
 def test_continue_while_running_is_a_success_and_emits_nothing():
@@ -345,3 +345,53 @@ def test_continue_tool_is_offered_and_prompt_explains_it():
     settle(b)
     assert "continue" in {t["name"] for t in llm.calls[0][2]}
     assert "`continue`" in DEFAULT_SYSTEM_PROMPT
+
+
+# --- goal input (R4) ---------------------------------------------------------------------------
+
+def test_prompt_has_goal_rules():
+    p = DEFAULT_SYSTEM_PROMPT.lower()
+    assert "goal" in p and "stop" in p and "impossible" in p and "short common nouns" in p
+    assert "continue" in p  # the existing guidance stays
+
+
+def test_setting_a_goal_while_idle_triggers_one_request_with_the_goal():
+    b, llm, clk, out = make(default=ToolChoice("search", {"items": ["bolt"]}))
+    b.on_world_state(ws(stamp=1))
+    settle(b)
+    n = len(llm.calls)
+    clk.t += 1  # well inside decide_interval_s: only the goal can trigger
+    b.on_world_state(ws(stamp=2, goal="find the bolt"))
+    settle(b)
+    for k in range(3, 6):  # the same goal again is not a new trigger
+        b.on_world_state(ws(stamp=k, goal="find the bolt"))
+        settle(b)
+    assert len(llm.calls) == n + 1
+    user = llm.calls[-1][1]
+    assert user.splitlines()[0] == "goal: find the bolt"
+    assert "asked now because: new goal: find the bolt" in user
+
+
+def test_changing_the_goal_mid_skill_asks_and_continue_keeps_the_skill():
+    run_call = SkillCall(SkillName.SEARCH, {"items": ("bolt",)})
+    b, llm, clk, out = make(default=ToolChoice("continue", {}, "still searching"))
+    b.on_world_state(ws(stamp=1, state=SkillState.RUNNING, call=run_call, goal="find the bolt"))
+    settle(b)
+    n, emitted = len(llm.calls), len(out)
+    b.on_world_state(ws(stamp=2, state=SkillState.RUNNING, call=run_call, goal="find the bolt or a nut"))
+    settle(b)
+    assert len(llm.calls) == n + 1
+    assert "new goal: find the bolt or a nut" in llm.calls[-1][1]
+    assert len(out) == emitted and b.status()["failures"] == 0
+
+
+def test_clearing_the_goal_does_not_cause_a_decision_storm():
+    run_call = SkillCall(SkillName.EXPLORE)
+    b, llm, clk, out = make(default=ToolChoice("continue", {}))
+    b.on_world_state(ws(stamp=1, state=SkillState.RUNNING, call=run_call, goal="find the bolt"))
+    settle(b)
+    n = len(llm.calls)
+    for k in range(2, 12):
+        b.on_world_state(ws(stamp=k, state=SkillState.RUNNING, call=run_call, goal=""))
+        settle(b)
+    assert len(llm.calls) == n

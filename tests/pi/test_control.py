@@ -338,7 +338,7 @@ def test_supervisor_exception_stops_motor(clock, motor):
     c.submit_manual(0.3, 0.0)
     d = c.tick()
     assert d.stopped and d.throttle == 0.0 and d.steering == 0.0
-    assert d.reason.value == "fault"
+    assert d.reason is Reason.FAULT and d.reason.value == "fault"
     assert motor.stop_count == 1
     st = c.status()
     assert st["reason"] == "fault" and "boom" in st["fault"]

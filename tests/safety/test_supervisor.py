@@ -258,3 +258,14 @@ def test_non_numeric_command_is_invalid_not_an_exception(sup, throttle, steering
 def test_steering_corridor_must_stay_inside_coverage_fov():
     with pytest.raises(ValueError):
         SafetyConfig(max_steer_rad=math.radians(55), coverage_fov_rad=math.radians(120))
+
+
+def test_reason_values_are_stable_and_fault_ultrasonic_appended():
+    # Values go over the link (PiStatus.safety_reason); never rename or reorder them.
+    assert [r.value for r in Reason] == [
+        "ok", "slowed", "estop", "invalid_time", "no_scan", "scan_stale", "scan_from_future",
+        "no_command", "command_stale", "command_from_future", "invalid_command", "reverse_blocked",
+        "low_coverage", "obstacle", "fault", "ultrasonic"]
+    from locatebot.safety.supervisor import SafetyDecision
+    assert SafetyDecision(0.0, 0.0, Reason.FAULT).stopped
+    assert SafetyDecision(0.0, 0.0, Reason.ULTRASONIC).stopped

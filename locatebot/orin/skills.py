@@ -53,6 +53,7 @@ class ExecutorConfig:
     follow_distance_m: float = 1.0
     follow_lost_s: float = 6.0         # fail when the target hasn't been confirmed for this long
     follow_gate_m: float = 0.5         # LiDAR cluster must be this close to the predicted target
+    follow_person_gate_m: float = 1.0  # a person track must be this close to the last target
     look_around_throttle_frac: float = 0.5   # of VehicleConfig.max_throttle
     look_around_timeout_s: float = 60.0
     explore_plan_attempts: int = 3     # frontier goals tried per tick before waiting
@@ -71,6 +72,7 @@ class TickInput:
     scan: Scan | None
     tracker: ItemTracker | None
     home: Pose2D = field(default_factory=lambda: Pose2D(0.0, 0.0, 0.0))
+    people: tuple = ()   # lidar.people.PersonTrack (M3): follow(person) prefers these to raw clusters
 
 
 @dataclass(frozen=True)
@@ -515,6 +517,8 @@ class SkillExecutor:
             self._target = (track.x, track.y)  # fresh vision fix wins
             self._target_fix_s = self._target_seen_s = track.last_seen_s
             return
+        if item.strip().lower() in ("person", "people") and inp.people and self._follow_person(inp):
+            return
         if self._target is None or inp.scan is None:
             return
         # Between vision fixes: follow the LiDAR cluster nearest the last known position.
@@ -529,6 +533,28 @@ class SkillExecutor:
         if best is not None:
             self._target = best
             self._target_seen_s = inp.now
+
+    def _follow_person(self, inp: TickInput) -> bool:
+        """follow(person) between vision fixes: the people tracker's track nearest the last target
+        (or, before any fix, the nearest person). Tracks carry their own velocity and identity, so
+        a chair leg or a wall corner near the person can't steal the target as a raw cluster can."""
+        best, best_d = None, math.inf
+        for t in inp.people:
+            if not getattr(t, "is_person", True):
+                continue
+            if self._target is not None:
+                d = math.hypot(t.x - self._target[0], t.y - self._target[1])
+                if d > self.config.follow_person_gate_m:
+                    continue
+            else:
+                d = math.hypot(t.x - inp.pose.x, t.y - inp.pose.y)
+            if d < best_d:
+                best, best_d = t, d
+        if best is None:
+            return False
+        self._target = (float(best.x), float(best.y))
+        self._target_seen_s = max(self._target_seen_s, min(inp.now, float(best.last_seen_s)))
+        return True
 
     def _follow(self, call: SkillCall, inp: TickInput) -> DriveOutput:
         item = call.args.get("item")

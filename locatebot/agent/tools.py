@@ -66,7 +66,7 @@ def _arg_schema(skill: SkillName, arg: str, typ: type) -> dict:
         return dict(_ITEM_SCHEMA)
     if typ is float:
         return {"type": "number", "description": f"Map-frame {arg} in metres."}
-    if typ is list:
+    if typ is tuple:  # a JSON array on the wire, a tuple in the SkillCall
         return {
             "type": "array",
             "items": dict(_ITEM_SCHEMA),
@@ -133,7 +133,7 @@ def _number(v: Any, what: str) -> float:
     return f
 
 
-def _items(v: Any) -> list[str]:
+def _items(v: Any) -> tuple[str, ...]:
     if not isinstance(v, (list, tuple)):
         raise InvalidSkillCall(f"items must be a list of strings, got {type(v).__name__}")
     if not v:
@@ -145,7 +145,7 @@ def _items(v: Any) -> list[str]:
         s = _clean_text(x, f"items[{k}]", MAX_ITEM_CHARS)
         if s not in out:
             out.append(s)
-    return out
+    return tuple(out)
 
 
 def parse_tool_call(name: Any, args: Any, source: str = "llm", reason: str = "") -> SkillCall:
@@ -186,7 +186,7 @@ def parse_tool_call(name: Any, args: Any, source: str = "llm", reason: str = "")
             out[arg] = _clean_text(v, arg, MAX_ITEM_CHARS)
         elif typ is float:
             out[arg] = _number(v, arg)
-        elif typ is list:
+        elif typ is tuple:
             out[arg] = _items(v)
         else:  # pragma: no cover - guarded by _build_definitions at import
             raise InvalidSkillCall(f"unsupported argument type for {arg}")

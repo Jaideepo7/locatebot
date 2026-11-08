@@ -14,6 +14,11 @@ Call it every control tick on the Pi with the newest scan and drive command (bot
 - Clearance ≤ `stop_distance_m` stops; up to `slow_distance_m` the throttle cap rises linearly to `max_speed`. Requested speed is never raised.
 - Reverse is always blocked (no rear policy yet). Zero throttle on a healthy scan is allowed (steer in place).
 
+## Reasons not produced by `evaluate`
+`Reason` is the one enum for every stop reason the Pi reports (`PiStatus.safety_reason` sends its `.value`). Two members are appended for callers outside `evaluate`; existing values never change:
+- `Reason.FAULT` (`"fault"`): the Pi control loop (`locatebot/pi/control.py`, `PiController.tick`) caught an exception and stopped the motor.
+- `Reason.ULTRASONIC` (`"ultrasonic"`): reserved for the front ultrasonic fusion (ROADMAP T1.2); nothing produces it yet.
+
 ## Corridor coverage needs dense scans
 The corridor gate needs a valid return in every ~2° bin, so a LiDAR with beam spacing coarser than about 1.9° can never pass it. The RPLIDAR C1 (~0.07° spacing) is far above that, but glossy or black surfaces, or open space beyond 12 m straight ahead, can empty a bin and stop the car. Measure how often `LOW_COVERAGE` fires on clean scans on the real car; if it is too often, add hysteresis (N consecutive bad scans) for the coverage stop only. Never relax the obstacle stop.
 

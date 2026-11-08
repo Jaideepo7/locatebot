@@ -2,17 +2,22 @@
 
 Output is bounded: at most ``MAX_ITEMS_LISTED`` item lines, free-text fields are flattened to
 one line and truncated. Directions are in the robot frame (bearing CCW positive = left).
+The first line is always the goal (``goal: <text>`` or ``goal: none``).
 """
 from __future__ import annotations
 
 import math
 from typing import Any, Mapping
 
-from locatebot.mission.types import ItemView, SkillCall, SkillState, WorldState
+from locatebot.mission.types import ChangeView, ItemView, PersonView, SkillCall, SkillState, WorldState
 
 MAX_ITEMS_LISTED = 6
+MAX_CHANGES_LISTED = 3
+MAX_PEOPLE_LISTED = 3
+MAX_NOTES_LISTED = 4
 MAX_TEXT_CHARS = 120
 MAX_NAME_CHARS = 24
+MAX_GOAL_CHARS = 200
 AHEAD_DEG = 5.0      # |bearing| at or below this reads "ahead"
 BEHIND_DEG = 135.0   # |bearing| at or above this reads "behind (...)"
 
@@ -133,6 +138,44 @@ def _items_lines(items: tuple[ItemView, ...]) -> list[str]:
     return lines
 
 
+def _changes_line(changes: tuple[ChangeView, ...]) -> list[str]:
+    """'changes: 2 new things: 0.4 m wide at 1.2 m ahead (moving), ...'; nothing when empty."""
+    if not changes:
+        return []
+    shown = sorted(changes, key=lambda c: c.range_m if math.isfinite(c.range_m) else math.inf)
+    parts = [f"{c.width_m:.1f} m wide at {_fmt_range(c.range_m)} {format_bearing(c.bearing_rad)}"
+             + (" (moving)" if c.moving else "") for c in shown[:MAX_CHANGES_LISTED]]
+    more = len(changes) - len(parts)
+    n = len(changes)
+    return [f"changes: {n} new thing{'s' if n != 1 else ''}: " + ", ".join(parts)
+            + (f" (+{more} more)" if more > 0 else "")]
+
+
+def _person_text(p: PersonView) -> str:
+    where = f"{_fmt_range(p.range_m)} {format_bearing(p.bearing_rad)}"
+    tags = []
+    if p.moving:
+        tags.append(f"{p.speed_mps:.1f} m/s")
+    tags.append("camera-confirmed" if p.confirmed_by_camera else "lidar only")
+    return f"{where} {'walking' if p.moving else 'standing'} ({', '.join(tags)})"
+
+
+def _people_line(people: tuple[PersonView, ...]) -> list[str]:
+    """'people: 1 person 1.2 m ahead walking (0.6 m/s, camera-confirmed)'; 'people: none'."""
+    if not people:
+        return ["people: none"]
+    shown = sorted(people, key=lambda p: p.range_m if math.isfinite(p.range_m) else math.inf)
+    n = len(people)
+    head = "1 person" if n == 1 else f"{n} people:"
+    parts = [_person_text(p) for p in shown[:MAX_PEOPLE_LISTED]]
+    more = n - len(parts)
+    return [f"people: {head} " + ", ".join(parts) + (f" (+{more} more)" if more > 0 else "")]
+
+
+def _notes_lines(notes: tuple[str, ...]) -> list[str]:
+    return [one_line(n) for n in notes[:MAX_NOTES_LISTED] if one_line(n)]
+
+
 def render_world_state(ws: WorldState) -> str:
     p = ws.pose
     heading = _signed_deg(p.theta)
@@ -142,6 +185,7 @@ def render_world_state(ws: WorldState) -> str:
     else:
         explored = f"{100.0 * min(max(ws.explored_frac, 0.0), 1.0):.0f} %"
     lines = [
+        f"goal: {one_line(getattr(ws, 'goal', ''), MAX_GOAL_CHARS) or 'none'}",
         f"pose: ({p.x:.1f}, {p.y:.1f}) m, heading {heading:.0f}°   explored: {explored}   "
         f"mission: {one_line(ws.mission_state, 40)}   safety: {one_line(ws.safety_reason, 40)}"
     ]
@@ -156,6 +200,9 @@ def render_world_state(ws: WorldState) -> str:
         more = len(ws.search_items) - len(shown)
         lines.append("looking for: " + ", ".join(shown) + (f" (+{more} more)" if more > 0 else ""))
     lines.extend(_items_lines(tuple(ws.items)))
+    lines.extend(_people_line(tuple(getattr(ws, "people", ()))))
+    lines.extend(_changes_line(tuple(getattr(ws, "changes", ()))))
+    lines.extend(_notes_lines(tuple(getattr(ws, "notes", ()))))
     sk = ws.skill
     state = getattr(sk.state, "value", str(sk.state))
     if sk.call is None and sk.state == SkillState.IDLE:

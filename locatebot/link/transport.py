@@ -1,8 +1,10 @@
 """ZeroMQ PUB/SUB transport for the Pi <-> Orin link, over the wire format in ``messages``.
 
 Sockets (``docs/link/README.md``)
-- Pi PUB binds ``tcp://*:5555`` (``scan``, ``frame``, ``pi_status``); the Orin SUB connects.
-- Orin PUB binds ``tcp://*:5556`` (``drive``, ``estop``, ``orin_status``); the Pi SUB connects.
+- Pi PUB binds ``tcp://*:5555`` (``scan``, ``frame``, ``pi_status``, ``range``,
+  ``mission_request``, ``mission_cancel``); the Orin SUB connects.
+- Orin PUB binds ``tcp://*:5556`` (``drive``, ``estop``, ``orin_status``, ``mission_status``);
+  the Pi SUB connects. Mission topics must never be ``newest_only``.
 Addresses come from the caller (config/CLI) or the ``LOCATEBOT_PI_HOST`` /
 ``LOCATEBOT_ORIN_HOST`` environment variables. No real address is hard-coded.
 

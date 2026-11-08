@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from locatebot.lidar.mapping import demo_room
-from locatebot.lidar.sim import simulate_scan
+from locatebot.lidar.sim import Room, simulate_scan
 from locatebot.lidar.types import Pose2D
 from locatebot.mission.types import SkillName, VehicleConfig
 from locatebot.orin.app import AppConfig, OrinApp, PeerClock, _png, make_server, map_png
@@ -158,3 +158,171 @@ def test_orin_run_sim_smoke():
                        capture_output=True, text=True, timeout=60, cwd=ROOT)
     assert p.returncode == 0, p.stderr[-2000:]
     assert "operator page: http://127.0.0.1:" in p.stdout and "stopped:" in p.stdout
+
+
+def test_radar_page_and_scan_json(server):
+    app, base, _ = server
+    code, ctype, page = get(base + "/radar")
+    assert code == 200 and b"<canvas" in page and b"/scan.json" in page
+    assert b"http://" not in page and b"https://" not in page
+    code, _, raw = get(base + "/scan.json")
+    s = json.loads(raw)
+    assert s["seq"] == 4 and len(s["a"]) == len(s["r"]) == len(s["q"]) == s["n_valid"] > 100
+    assert all(r > 0 for r in s["r"]) and -180.0 <= min(s["a"]) and max(s["a"]) <= 180.0
+    assert set(s["pose"]) == {"x", "y", "theta_deg"}
+
+
+def test_scan_json_without_scans_and_downsampling():
+    from locatebot.orin.app import scan_json
+    empty = OrinRuntime(LiveMapper(size_m=8.0), SkillExecutor(VehicleConfig()))
+    assert scan_json(empty)["a"] == []
+    s = scan_json(runtime_with_map(), max_points=50)
+    assert len(s["a"]) == 50 and s["n_valid"] > 50
+
+
+def _orin_run_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("orin_run", ROOT / "tools" / "orin_run.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_nemotron_preset_uses_nvidia_api_and_key_env(monkeypatch):
+    import argparse
+    mod = _orin_run_module()
+    llm = mod.make_llm(argparse.Namespace(llm="nemotron", llm_model="nvidia/some-nemotron", llm_url=None))
+    assert llm.url == "https://integrate.api.nvidia.com/v1/chat/completions"
+    assert llm.model == "nvidia/some-nemotron" and llm.api_key_env == "NVIDIA_API_KEY"
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+    headers, body = llm.build_request("sys", "user", [])
+    assert body["model"] == "nvidia/some-nemotron" and body["tool_choice"] == "auto"
+    assert any(v == "Bearer nvapi-test" for v in headers.values())
+    # no --llm-model: the slug verified live on 2026-11-08 (tool calls + images)
+    llm = mod.make_llm(argparse.Namespace(llm="nemotron", llm_model=None, llm_url=None))
+    assert llm.model == "nvidia/nemotron-3.5-super-vl-120b-a12b"
+    assert body["chat_template_kwargs"] == {"enable_thinking": False} and body["parallel_tool_calls"] is False
+
+
+def test_relocalize_endpoint_needs_saved_map_mode(server):
+    app, base, _ = server
+    assert post(base + "/relocalize", {})[0] == 409            # building a new map
+    assert post(base + "/relocalize", {"x": "a", "y": 1})[0] == 400
+    code, body = get(base + "/status")[0], json.loads(get(base + "/status")[2])
+    assert body["map"]["mode"] == "mapping"
+
+
+def test_relocalize_endpoint_in_saved_map_mode(tmp_path):
+    from locatebot.lidar.mapping import Mapper
+    rng = np.random.default_rng(3)
+    room = Room.box(4.0, 3.0).with_box(1.0, 1.0, 1.4, 1.6)
+    m = Mapper(size_m=8.0)
+    for i in range(5):
+        m.add_scan(simulate_scan(room, Pose2D(2.5, 1.5, 0.1), rng=rng, stamp_s=i * 0.1, seq=i))
+    path = m.save(tmp_path / "box")["lbmap"]
+    rt = OrinRuntime(LiveMapper.from_saved(path, guess=Pose2D(0, 0, 0)), SkillExecutor(VehicleConfig()))
+    rt.on_scan(simulate_scan(room, Pose2D(2.5, 1.5, 0.1), rng=rng, stamp_s=1.0, seq=9))
+    app = OrinApp(rt, lambda t, s: None)
+    st = app.status()["map"]
+    assert st["mode"] == "localizing" and st["initialized"] and not st["lost"]
+    assert app.relocalize({"x": 0.1, "y": 0.0, "theta_deg": 5}) is True
+    assert app.runtime.mapper.stats()["initialized"] is False
+    with pytest.raises(ValueError):
+        app.relocalize({"x": float("nan"), "y": 0})
+
+
+def test_orin_run_sim_with_saved_map_writes_v2(tmp_path):
+    from locatebot.lidar.mapping import Mapper
+    mod = _orin_run_module()
+    src = mod.SimSource(VehicleConfig())
+    rng = np.random.default_rng(4)
+    m = Mapper(size_m=12.0)
+    for i in range(10):  # the map frame is the sim car's start pose, like a real first session
+        m.add_scan(simulate_scan(src.room, src.car.pose, n_beams=508, rng=rng, stamp_s=i * 0.1, seq=i))
+    path = m.save(tmp_path / "simroom")["lbmap"]
+    p = subprocess.run([sys.executable, str(ROOT / "tools" / "orin_run.py"), "--sim", "--port", "0", "--seconds", "3",
+                        "--map", str(path), "--start-pose", "0,0,0"],
+                       capture_output=True, text=True, timeout=60, cwd=ROOT)
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert "updated map:" in p.stdout, p.stdout + p.stderr[-2000:]
+    assert (tmp_path / "simroom.v2.lbmap").exists()
+    assert mod.map_stem(Path("maps/room.2026.11.08.lbmap")) == Path("maps/room.2026.11.08")
+
+
+def test_pi_drive_sink_sends_orin_status_with_one_boot_id_per_process(monkeypatch):
+    import locatebot.link.transport as transport
+    from locatebot.link.messages import OrinStatus
+    mod = _orin_run_module()
+    monkeypatch.setattr(transport, "bind_endpoint", lambda port, interface="*": "tcp://127.0.0.1:*")
+    rt = runtime_with_map(1)
+    sink = mod.PiDriveSink(rt)
+    sub = transport.Subscriber(sink.pub.endpoint, ["drive", "orin_status"])
+    try:
+        statuses, end = [], time.monotonic() + 5.0
+        while not statuses and time.monotonic() < end:
+            sink.last_status = 0.0  # force a status every call until the subscriber has joined
+            sink(0.0, 0.0)
+            statuses += [m for m in sub.poll(0.05) if isinstance(m, OrinStatus)]
+        assert statuses, "no orin_status received"
+        assert {s.boot_id for s in statuses} == {mod.BOOT_ID}
+        assert len(mod.BOOT_ID) == 32 and int(mod.BOOT_ID, 16) >= 0
+    finally:
+        sub.close()
+        sink.close()
+    other = mod.PiDriveSink(rt)  # a second sink in the same process keeps the boot id
+    try:
+        assert other.boot_id == mod.BOOT_ID
+    finally:
+        other.close()
+
+
+def test_orin_run_pi_mode_mission_wiring_over_zeromq(monkeypatch):
+    """tools/orin_run.py --pi-host wiring: Pi scans + MissionRequest in over ZeroMQ, the bridge
+    runs it, MissionStatus comes back out through PiDriveSink (127.0.0.1 ports, no hardware)."""
+    import locatebot.link.transport as transport
+    from locatebot.link.messages import MissionCancel, MissionRequest, MissionStatus
+    from locatebot.orin.missions import MissionBridge
+    mod = _orin_run_module()
+    monkeypatch.setattr(transport, "bind_endpoint", lambda port, interface="*": "tcp://127.0.0.1:*")
+    fake_pi = transport.Publisher("tcp://127.0.0.1:*")
+    monkeypatch.setattr(transport, "pi_pub_endpoint", lambda host=None: fake_pi.endpoint)
+
+    rt = runtime_with_map(5)
+    sink = mod.PiDriveSink(rt)
+    rt.missions = MissionBridge(rt, sink.queue)
+    app = OrinApp(rt, sink)
+    listener = transport.Subscriber(sink.pub.endpoint, ["mission_status"])
+    stop = threading.Event()
+    src = threading.Thread(target=mod.pi_source, args=(app, stop, "ignored", mod.PeerClock()), daemon=True)
+    src.start()
+    rng = np.random.default_rng(5)
+    seq = [100]
+
+    def pump(until, timeout_s=10.0):
+        got, end = [], time.monotonic() + timeout_s
+        while time.monotonic() < end:
+            seq[0] += 1
+            fake_pi.send(simulate_scan(demo_room(), Pose2D(4.0, 3.0, 0.0), rng=rng,
+                                       stamp_s=time.monotonic(), seq=seq[0]))
+            app.step_once()
+            sink(0.0, 0.0)  # drains queued MissionStatus onto the PUB socket
+            got += [m for m in listener.poll(0.03) if isinstance(m, MissionStatus)]
+            if until(got):
+                return got
+        return got
+
+    try:
+        now = time.time()
+        req = MissionRequest("m-1", "marker", now, now + 300)
+        statuses = pump(lambda g: (fake_pi.send(req) or True) and any(s.state == "ACCEPTED" for s in g))
+        assert any(s.mission_id == "m-1" and s.state == "ACCEPTED" for s in statuses), statuses
+        assert rt.goal == "find marker"
+        statuses = pump(lambda g: (fake_pi.send(MissionCancel("m-1", "customer")) or True)
+                        and any(s.state == "CANCELLED" for s in g))
+        assert any(s.mission_id == "m-1" and s.state == "CANCELLED" for s in statuses), statuses
+    finally:
+        stop.set()
+        src.join(3.0)
+        listener.close()
+        sink.close()
+        fake_pi.close()

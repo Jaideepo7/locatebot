@@ -22,6 +22,10 @@ Operator page (stdlib HTTP, everything inline, no CDN):
 - ``POST /stop``      operator STOP (pauses LLM decisions until ``/resume``)
 - ``POST /approve``, ``POST /reject``, ``POST /resume``, ``POST /mode`` ``{"mode": "approve"|"auto"}``
 - ``POST /save_map``  ``{"name": "room1"}`` -> ``maps/<name>.lbmap/.pgm/.yaml``
+- ``POST /goal``      ``{"text": "find the bolt"}`` goal for the LLM (1-200 chars, 400 if invalid)
+- ``POST /goal/clear`` clear the goal
+- ``POST /relocalize`` ``{"x": 1.0, "y": 2.0, "theta_deg": 90}`` (or ``{}``: global search) -
+                      saved-map mode (``--map``) only: re-initialize localization
 
 POST bodies must be ``application/json`` (blocks cross-site form posts). Default bind host is
 127.0.0.1; anyone who can reach the port can command the robot.
@@ -195,6 +199,25 @@ class OrinApp:
         paths = self.runtime.mapper.save(Path(self.config.maps_dir) / name, meta={"saved_by": "operator"})
         return {k: str(v) for k, v in paths.items()}
 
+    def relocalize(self, body: dict) -> bool:
+        """Re-initialize localization in a saved map around an operator pose (``{}`` = global).
+        Returns False when the session is building a new map (nothing to localize in)."""
+        from locatebot.lidar.types import Pose2D
+        guess = None
+        if body:
+            try:
+                x, y, th = float(body["x"]), float(body["y"]), math.radians(float(body.get("theta_deg", 0.0)))
+            except (KeyError, TypeError, ValueError) as e:
+                raise ValueError("relocalize needs numbers x, y and optional theta_deg") from e
+            if not all(map(math.isfinite, (x, y, th))):
+                raise ValueError("relocalize pose must be finite")
+            guess = Pose2D(x, y, th)
+        mapper = self.runtime.mapper
+        if not getattr(mapper, "localizing", False):
+            return False
+        mapper.relocalize(guess)
+        return True
+
     def status(self) -> dict:
         out = self.runtime.status()
         with self._lock:
@@ -219,13 +242,58 @@ def _png(gray: np.ndarray) -> bytes:
             + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
-def map_png(runtime: OrinRuntime) -> bytes:
-    """Map image, north up: row 0 is the top (max y), like the PGM export."""
+def map_png(runtime: OrinRuntime, overlay: str | None = None) -> bytes:
+    """Map image, north up: row 0 is the top (max y), like the PGM export.
+
+    ``overlay="wifi"`` (M3, saved-map mode): cells with Wi-Fi readings tinted red (-90 dBm) to
+    green (-40 dBm); an RGB PNG. Without readings it is the plain grey map."""
     classes = runtime.mapper.grid_snapshot().classify()
     img = np.full(classes.shape, 160, np.uint8)
     img[classes == FREE] = 255
     img[classes == OCCUPIED] = 0
-    return _png(np.ascontiguousarray(img[::-1]))
+    wifi = runtime.mapper.layer_snapshot("wifi_rssi") if overlay == "wifi" and hasattr(
+        runtime.mapper, "layer_snapshot") else None
+    if wifi is None or wifi.shape != img.shape or not np.isfinite(wifi).any():
+        return _png(np.ascontiguousarray(img[::-1]))
+    rgb = np.repeat(img[:, :, None], 3, axis=2).astype(np.float32)
+    m = np.isfinite(wifi)
+    t = np.clip((wifi[m] + 90.0) / 50.0, 0.0, 1.0)
+    tint = np.column_stack((255 * (1 - t), 255 * t, np.full_like(t, 40)))
+    rgb[m] = 0.4 * rgb[m] + 0.6 * tint
+    return _png_rgb(np.ascontiguousarray(rgb.astype(np.uint8)[::-1]))
+
+
+def _png_rgb(rgb: np.ndarray) -> bytes:
+    """Encode an 8-bit RGB image (H, W, 3) as PNG (stdlib zlib only)."""
+    h, w, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[r].tobytes() for r in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def scan_json(runtime: OrinRuntime, max_points: int = 1000) -> dict:
+    """Newest scan for the live radar view: valid points only, robot frame, angles in degrees.
+
+    Includes the pose so the page can show heading, and a per-second scan rate."""
+    scan = runtime.mapper.latest_scan
+    if scan is None:
+        return {"seq": None, "stamp_s": None, "a": [], "r": [], "q": []}
+    m = scan.valid_mask()
+    a = np.degrees(scan.angles_rad[m])
+    r = scan.ranges_m[m]
+    q = scan.quality[m]
+    if len(a) > max_points:
+        idx = np.linspace(0, len(a) - 1, max_points).astype(int)
+        a, r, q = a[idx], r[idx], q[idx]
+    p = runtime.mapper.pose
+    return {"seq": scan.seq, "stamp_s": scan.stamp_s, "n_beams": len(scan), "n_valid": int(m.sum()),
+            "a": np.round(a, 2).tolist(), "r": np.round(r, 3).tolist(), "q": q.astype(int).tolist(),
+            "pose": {"x": round(p.x, 3), "y": round(p.y, 3), "theta_deg": round(math.degrees(p.theta), 1)},
+            "scans": runtime.mapper.stats()["scans"]}
 
 
 # ---------------------------------------------------------------------- HTTP
@@ -272,7 +340,11 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/status":
             self._json(200, app.status())
         elif self.path.startswith("/map.png"):
-            self._send(200, map_png(app.runtime), "image/png")
+            self._send(200, map_png(app.runtime, "wifi" if "wifi=1" in self.path else None), "image/png")
+        elif self.path.startswith("/scan.json"):
+            self._json(200, scan_json(app.runtime))
+        elif self.path == "/radar":
+            self._send(200, RADAR_PAGE.encode(), "text/html; charset=utf-8")
         else:
             self._json(404, {"error": "not found"})
 
@@ -318,6 +390,16 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "mode": rt.brain.mode})
             if self.path == "/save_map":
                 return self._json(200, {"ok": True, "files": app.save_map(body.get("name", ""))})
+            if self.path == "/goal":
+                goal = rt.set_goal(body.get("text"), source="operator")
+                return self._json(200, {"ok": True, "goal": goal})
+            if self.path == "/goal/clear":
+                rt.clear_goal()
+                return self._json(200, {"ok": True})
+            if self.path == "/relocalize":
+                if not app.relocalize(body):
+                    return self._json(409, {"error": "not localizing in a saved map (start with --map)"})
+                return self._json(200, {"ok": True})
             return self._json(404, {"error": "not found"})
         except (ValueError, InvalidSkillCall, json.JSONDecodeError) as e:
             return self._json(400, {"error": str(e)})
@@ -346,13 +428,15 @@ button.go{background:var(--ok);border:0}input,select{background:#222;color:var(-
 #events div{font-size:13px;color:#ccc;padding:2px 0;border-bottom:1px solid #262626}
 .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 0}
 </style></head><body>
-<header><h1>locatebot mission</h1><span id="conn" class="k">connecting...</span><button id="stop">STOP</button></header>
+<header><h1>locatebot mission</h1><a href="/radar" style="color:#9cf">live radar</a><span id="conn" class="k">connecting...</span><button id="stop">STOP</button></header>
 <main>
 <section><h2>Map</h2><canvas id="map" width="400" height="400"></canvas>
-<div class="row k" id="mapinfo"></div>
+<div class="row k" id="mapinfo"></div><label class="k"><input type="checkbox" id="wifi"> Wi-Fi overlay</label>
 <div class="row"><input id="mapname" placeholder="map name" size="12"><button id="save">Save map</button></div></section>
 <section>
-<h2>Skill</h2><table id="skill"></table>
+<h2>Goal</h2><div class="row"><span id="goal" class="k">none</span></div>
+<div class="row"><input id="goaltext" placeholder="e.g. find the bolt" size="24" maxlength="200"><button class="go" id="setgoal">Set goal</button><button id="cleargoal">Clear</button></div>
+<h2 style="margin-top:12px">Skill</h2><table id="skill"></table>
 <div id="proposal"><b>LLM proposes:</b> <span id="prop"></span>
 <div class="row"><button class="go" id="approve">Approve</button><button id="reject">Reject</button></div></div>
 <div class="row"><span class="k">LLM:</span><span id="brain">-</span>
@@ -369,12 +453,16 @@ async function post(path,body){const r=await fetch(path,{method:"POST",headers:{
  const j=await r.json().catch(()=>({}));if(!r.ok)alert(j.error||r.status);return j}
 $("stop").onclick=()=>post("/stop");$("approve").onclick=()=>post("/approve");$("reject").onclick=()=>post("/reject");
 $("resume").onclick=()=>post("/resume");
+$("setgoal").onclick=()=>post("/goal",{text:$("goaltext").value});$("cleargoal").onclick=()=>post("/goal/clear");
 $("mode").onclick=async()=>{const m=(window.lastStatus&&window.lastStatus.brain&&window.lastStatus.brain.mode)==="auto"?"approve":"auto";post("/mode",{mode:m})};
 $("send").onclick=()=>{let a={};const t=$("sargs").value.trim();if(t){try{a=JSON.parse(t)}catch(e){alert("args must be JSON");return}}post("/skill",{name:$("sname").value,args:a})};
 $("save").onclick=async()=>{const j=await post("/save_map",{name:$("mapname").value.trim()});if(j.ok)alert("saved "+j.files.lbmap)};
 const img=new Image();let imgReady=false;img.onload=()=>{imgReady=true;draw()};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 function rows(el,pairs){el.innerHTML=pairs.map(([k,v])=>`<tr><td class="k">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
+function mapMode(m){if(m.mode!=="localizing")return "mapping (new map)";
+ const st=m.lost?"LOST":m.ambiguous?"ambiguous: give a start pose":!m.initialized?"localizing...":"localized ("+m.source+")";
+ return st+(m.last_score==null?"":" score "+m.last_score)+(m.changes?", "+m.changes+" new things":"")}
 function draw(){const s=window.lastStatus;if(!s||!imgReady)return;const c=$("map"),g=c.getContext("2d"),m=s.map_meta;
  c.width=m.width;c.height=m.height;g.imageSmoothingEnabled=false;g.drawImage(img,0,0);
  const px=(x,y)=>[(x-m.origin_xy[0])/m.resolution_m,m.height-(y-m.origin_xy[1])/m.resolution_m];
@@ -382,16 +470,68 @@ function draw(){const s=window.lastStatus;if(!s||!imgReady)return;const c=$("map
  const p=s.pose,[u,v]=px(p.x,p.y),th=p.theta_deg*Math.PI/180;g.strokeStyle="#e33";g.fillStyle="#e33";g.lineWidth=2;
  g.beginPath();g.arc(u,v,4,0,7);g.fill();g.beginPath();g.moveTo(u,v);g.lineTo(u+12*Math.cos(th),v-12*Math.sin(th));g.stroke()}
 async function tick(){try{const s=await (await fetch("/status")).json();window.lastStatus=s;$("conn").textContent="live";
+ $("goal").textContent=s.goal?s.goal.text+" (by "+s.goal.source+")":"none";
  const sk=s.skill;rows($("skill"),[["state",sk.state],["skill",sk.call?sk.call.name+" "+JSON.stringify(sk.call.args)+" ("+sk.call.source+")":"-"],
   ["detail",sk.detail||"-"],["explored",s.explored_frac==null?"-":Math.round(s.explored_frac*100)+" %"],["safety",s.safety_reason],
   ["pose",`(${s.pose.x}, ${s.pose.y}) ${s.pose.theta_deg}°`],["drive",`thr ${s.app.command.throttle}  steer ${s.app.command.steering}`],
-  ["step ms",`${s.app.last_step_ms} (max ${s.app.max_step_ms})`]]);
+  ["step ms",`${s.app.last_step_ms} (max ${s.app.max_step_ms})`],["map",mapMode(s.map)]]);
  const b=s.brain;$("brain").textContent=b?`${b.mode}${b.paused?" (paused)":""}${b.in_fallback?" FALLBACK":""} failures ${b.failures}${b.last_error?" - "+b.last_error:""}`:"none (operator only)";
  const pend=b&&b.pending;$("proposal").style.display=pend?"block":"none";if(pend)$("prop").textContent=typeof pend==="string"?pend:JSON.stringify(pend);
  rows($("items"),s.items.map(i=>[i.name,`${i.confirmed?"confirmed":"unconfirmed"} (${i.sightings}) at (${i.x}, ${i.y})`]));
  $("events").innerHTML=s.events.slice().reverse().map(e=>`<div>${esc(e.text)}</div>`).join("");
  $("mapinfo").textContent=`${s.map.integrated}/${s.map.scans} scans integrated`;
- img.src="/map.png?"+Date.now();draw()}catch(e){$("conn").textContent="disconnected"}}
+ img.src="/map.png?"+($("wifi").checked?"wifi=1&":"")+Date.now();draw()}catch(e){$("conn").textContent="disconnected"}}
 setInterval(tick,700);tick();
 </script></body></html>
 """.replace("SKILLS", _SKILL_BUTTONS)
+
+
+RADAR_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>locatebot radar</title>
+<style>
+:root{--bg:#05080a;--fg:#d8f5e3;--dim:#6f8f7e;--grid:#173326;--grid2:#24503a;--pt:#5dff9e;--near:#ff4d4d;--mid:#ffc14d}
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px ui-monospace,monospace}
+#wrap{display:flex;flex-direction:column;height:100%}
+header{display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:8px 14px;border-bottom:1px solid var(--grid)}
+header b{font-size:15px}.k{color:var(--dim)}button{background:#0d1712;color:var(--fg);border:1px solid var(--grid2);border-radius:4px;padding:4px 10px;font:inherit}
+button.on{background:#1d4430}#cv{flex:1;width:100%;min-height:0;display:block}
+#sec{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px 12px;padding:8px 14px;border-top:1px solid var(--grid)}
+@media (max-width:700px){#sec{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style></head><body><div id="wrap">
+<header><b>LiDAR radar (live)</b><span id="st" class="k">connecting...</span>
+<span>range <button data-r="1">1 m</button><button data-r="2">2 m</button><button data-r="4">4 m</button><button data-r="8">8 m</button><button data-r="0" class="on">auto</button></span>
+<span>trail <button id="trail" class="on">on</button></span><a href="/" style="color:var(--dim)">mission page</a></header>
+<canvas id="cv"></canvas>
+<div id="sec"></div></div>
+<script>
+"use strict";
+const cv=document.getElementById("cv"),g=cv.getContext("2d");let fixedR=0,trail=true,last=null,frames=[],rate=0,lastSeq=null,seqT=[];
+document.querySelectorAll("button[data-r]").forEach(b=>b.onclick=()=>{fixedR=+b.dataset.r;document.querySelectorAll("button[data-r]").forEach(x=>x.classList.toggle("on",x===b))});
+document.getElementById("trail").onclick=e=>{trail=!trail;e.target.textContent=trail?"on":"off";e.target.classList.toggle("on",trail)};
+const NAMES=["front","front-left","left","back-left","back","back-right","right","front-right"];
+function resize(){const r=cv.getBoundingClientRect(),d=window.devicePixelRatio||1;cv.width=r.width*d;cv.height=r.height*d}
+window.addEventListener("resize",resize);resize();
+function colour(r){return r<0.4?getComputedStyle(document.documentElement).getPropertyValue("--near"):r<1.0?getComputedStyle(document.documentElement).getPropertyValue("--mid"):getComputedStyle(document.documentElement).getPropertyValue("--pt")}
+function draw(){const s=last;const W=cv.width,H=cv.height,cx=W/2,cy=H/2,d=window.devicePixelRatio||1;g.fillStyle="#05080a";g.fillRect(0,0,W,H);
+ if(!s||!s.r.length){g.fillStyle="#6f8f7e";g.font=14*d+"px monospace";g.fillText(s?"no valid points":"waiting for scans...",20*d,30*d);return}
+ let R=fixedR;if(!R){const sorted=[...s.r].sort((a,b)=>a-b);R=Math.max(0.5,Math.ceil(sorted[Math.floor(sorted.length*0.98)]*2)/2)}
+ const ppm=Math.min(W,H)/2/R*0.94,step=R<=2?0.25:R<=4?0.5:1;
+ g.lineWidth=1*d;for(let k=step;k<=R+1e-9;k+=step){g.strokeStyle=Math.abs(k-Math.round(k))<1e-6?"#24503a":"#173326";g.beginPath();g.arc(cx,cy,k*ppm,0,7);g.stroke();
+  g.fillStyle="#6f8f7e";g.font=11*d+"px monospace";g.fillText(k.toFixed(step<1?2:0)+" m",cx+4*d,cy-k*ppm-3*d)}
+ g.strokeStyle="#173326";for(let i=0;i<12;i++){const t=i*Math.PI/6;g.beginPath();g.moveTo(cx,cy);g.lineTo(cx-Math.sin(t)*R*ppm,cy-Math.cos(t)*R*ppm);g.stroke()}
+ const P=(a,r)=>{const t=a*Math.PI/180;return[cx-Math.sin(t)*r*ppm,cy-Math.cos(t)*r*ppm]};
+ if(trail){frames.forEach((f,i)=>{g.fillStyle="rgba(93,255,158,"+(0.08+0.05*i)+")";for(let j=0;j<f.r.length;j++){const[x,y]=P(f.a[j],f.r[j]);g.fillRect(x-d,y-d,2*d,2*d)}})}
+ for(let j=0;j<s.r.length;j++){const[x,y]=P(s.a[j],s.r[j]);g.fillStyle=colour(s.r[j]);g.fillRect(x-1.5*d,y-1.5*d,3*d,3*d)}
+ g.fillStyle="#ff4d4d";g.beginPath();g.arc(cx,cy,5*d,0,7);g.fill();g.strokeStyle="#ff4d4d";g.lineWidth=3*d;g.beginPath();g.moveTo(cx,cy);g.lineTo(cx,cy-28*d);g.stroke();
+ g.fillStyle="#d8f5e3";g.font=12*d+"px monospace";g.fillText("FRONT",cx-20*d,cy-34*d);g.fillText("LEFT",14*d,cy-6*d);g.fillText("RIGHT",W-54*d,cy-6*d)}
+function sectors(s){const best=new Array(8).fill(Infinity);for(let j=0;j<s.r.length;j++){let a=((s.a[j]+22.5)%360+360)%360;const k=Math.floor(a/45)%8;if(s.r[j]<best[k])best[k]=s.r[j]}
+ document.getElementById("sec").innerHTML=best.map((v,i)=>`<div><span class="k">${NAMES[i]}</span> ${isFinite(v)?v.toFixed(2)+" m":"none"}</div>`).join("")}
+async function loop(){for(;;){const t0=performance.now();try{const s=await (await fetch("/scan.json",{cache:"no-store"})).json();
+  if(s.seq!==lastSeq){lastSeq=s.seq;seqT.push(performance.now());seqT=seqT.filter(t=>performance.now()-t<2000);if(last&&last.r.length){frames.push(last);if(frames.length>4)frames.shift()}last=s;sectors(s)}
+  document.getElementById("st").textContent=`scan #${s.seq} | ${s.n_valid}/${s.n_beams} valid points | ${(seqT.length/2).toFixed(1)} scans/s | heading ${s.pose?s.pose.theta_deg:"-"}\u00b0`}
+ catch(e){document.getElementById("st").textContent="disconnected, retrying..."}
+ draw();await new Promise(r=>setTimeout(r,Math.max(20,100-(performance.now()-t0))))}}
+loop();
+</script></body></html>
+"""
