@@ -7,7 +7,8 @@
     "start": "tsx --env-file=.env src/index.ts",
     "telegram": "tsx --env-file=.env src/index.ts telegram",
     "imessage": "tsx --env-file=.env src/index.ts imessage",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "imessage-hello": "tsx --env-file=.env src/hello.ts"
   },
   "dependencies": {
     "@spectrum-ts/telegram": "^12.15.0",

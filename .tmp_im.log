@@ -1,9 +1,0 @@
-Open mode: anyone who messages the bot can drive the robot (set RESTRICT_SENDERS=1 to limit it).
-[spectrum.lifecycle] INFO Spectrum started {
-  'spectrum.lifecycle.provider_count': 1,
-  'spectrum.lifecycle.providers': 'imessage',
-  'spectrum.lifecycle.telemetry': false
-}
-locatebot bridge running (imessage), robot at http://127.0.0.1:8090
-iMessage messages stream live (line shared)
-iMessage polls stream live (line shared)
