@@ -22,6 +22,20 @@ git -C "$SRC" fetch --quiet origin "$COMMIT" || true
 git -C "$SRC" checkout --quiet "$COMMIT"
 git -C "$SRC" submodule update --init --recursive --quiet
 
+# Local patches on top of the pinned commit (applied once; re-runs skip them).
+#   locate-anything-streamed-weights.patch: on the GPU, stream weights from the
+#   file to the device instead of keeping a full host copy. Without it the model
+#   needs ~8 GB on the Orin's 7.3 GB shared memory and cudaMalloc fails.
+for patch in "$ROOT"/scripts/patches/locate-anything-*.patch; do
+  [[ -e "$patch" ]] || continue
+  if git -C "$SRC" apply --reverse --check "$patch" 2>/dev/null; then
+    echo "Patch already applied: $(basename "$patch")"
+  else
+    git -C "$SRC" apply "$patch"
+    echo "Applied patch: $(basename "$patch")"
+  fi
+done
+
 cuda="${LA_CUDA:-auto}"
 if [[ "$cuda" == auto ]]; then
   if command -v nvcc >/dev/null 2>&1; then cuda=1; else cuda=0; fi

@@ -1,0 +1,173 @@
+diff --git i/src/engine.cpp w/src/engine.cpp
+index 837e321..a5c5b1d 100644
+--- i/src/engine.cpp
++++ w/src/engine.cpp
+@@ -6,10 +6,15 @@
+ #include "projector.hpp"
+ #include "lm.hpp"
+ #include <thread>
++#include <cstdlib>
+ namespace la {
+ 
+ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path, int n_threads){
+     std::unique_ptr<Engine> eng(new Engine());
++    // GPU: stream weights file -> device so no full host copy is kept
++    // (host copy + device copy does not fit a unified-memory Jetson).
++    // LA_NO_STREAM_WEIGHTS=1 restores the original load-everything path.
++    eng->ml_.set_stream_weights(eng->be_.is_offloading() && !std::getenv("LA_NO_STREAM_WEIGHTS"));
+     if(!eng->ml_.load(gguf_path)) return nullptr;
+     if(!eng->tok_.load(eng->ml_)) return nullptr;
+     eng->be_.set_n_threads(n_threads > 0 ? n_threads
+diff --git i/src/model_loader.cpp w/src/model_loader.cpp
+index 192e321..b1c0b34 100644
+--- i/src/model_loader.cpp
++++ w/src/model_loader.cpp
+@@ -5,6 +5,9 @@
+ 
+ #include "ggml-backend.h"
+ 
++#include <cstdio>
++#include <sys/types.h>
++
+ namespace la {
+ 
+ // Weights read directly on the host via ->data (NOT graph nodes): they produce
+@@ -32,7 +35,8 @@ static std::vector<int32_t> kv_i32_arr(gguf_context* g, const char* k){
+ }
+ 
+ bool ModelLoader::load(const std::string& path){
+-    gguf_init_params p{ /*no_alloc=*/false, /*ctx=*/&ctx_ };
++    path_ = path;
++    gguf_init_params p{ /*no_alloc=*/stream_weights_, /*ctx=*/&ctx_ };
+     gguf_ = gguf_init_from_file(path.c_str(), p);
+     if (!gguf_) { LA_LOG("gguf_init_from_file failed: %s", path.c_str()); return false; }
+     cfg_.vit_hidden       = kv_u32(gguf_, LA_KV_VIT_HIDDEN);
+@@ -93,10 +97,14 @@ bool ModelLoader::kv_i32_array(const std::string& key, std::vector<int32_t>& out
+ bool ModelLoader::offload_weights(Backend& be){
+     // CPU backend: no-op. Graphs keep referencing the gguf host tensors in ctx_
+     // directly (zero-copy; the CPU path is byte-identical to before this change).
+-    if (!be.is_offloading()) return true;
++    if (!be.is_offloading()) {
++        if (stream_weights_) { LA_LOG("offload_weights: streamed load needs a GPU backend"); return false; }
++        return true;
++    }
+     if (device_ctx_) return true;                       // idempotent
+     ggml_backend_t backend = be.handle();
+     if (!backend || !ctx_){ LA_LOG("offload_weights: null backend/ctx"); return false; }
++    if (stream_weights_) return offload_streamed(backend, be.device_name());
+ 
+     // Mirror every gguf tensor EXCEPT the two host-read tensors into a no_alloc
+     // device context, allocate it on the backend, upload the bytes, and repoint
+@@ -135,11 +143,75 @@ bool ModelLoader::offload_weights(Backend& be){
+     return true;
+ }
+ 
++// Streaming variant of offload_weights: ctx_ holds metadata only (no_alloc),
++// so each tensor's bytes are read from the gguf file straight into the device
++// buffer (via a reused staging buffer) or, for the two host-read tensors, into
++// a small CPU buffer. Peak host memory is one tensor instead of the whole file.
++bool ModelLoader::offload_streamed(ggml_backend_t backend, const std::string& dev_name){
++    const size_t n = tensors_.size();
++    ggml_init_params dp{};
++    dp.mem_size = ggml_tensor_overhead() * (n + 8);
++    dp.no_alloc = true;
++    device_ctx_ = ggml_init(dp);
++    ggml_init_params hp{};
++    hp.mem_size = ggml_tensor_overhead() * 8;
++    hp.no_alloc = true;
++    host_ctx_ = ggml_init(hp);
++    if (!device_ctx_ || !host_ctx_){ LA_LOG("offload_streamed: ctx init failed"); return false; }
++
++    struct Job { ggml_tensor* dst; size_t off; bool host; };
++    std::vector<Job> jobs; jobs.reserve(n);
++    std::unordered_map<std::string, ggml_tensor*> newmap; newmap.reserve(n);
++    const size_t data_off = gguf_get_data_offset(gguf_);
++    size_t n_dev = 0, n_host = 0, max_dev = 0;
++    for (auto& kv : tensors_) {
++        const bool host = is_host_read_tensor(kv.first);
++        ggml_tensor* s = kv.second;
++        ggml_tensor* d = ggml_new_tensor(host ? host_ctx_ : device_ctx_, s->type, GGML_MAX_DIMS, s->ne);
++        ggml_set_name(d, kv.first.c_str());
++        const int64_t tid = gguf_find_tensor(gguf_, kv.first.c_str());
++        if (tid < 0){ LA_LOG("offload_streamed: tensor %s not in gguf", kv.first.c_str()); return false; }
++        if (gguf_get_tensor_size(gguf_, tid) != ggml_nbytes(d)){
++            LA_LOG("offload_streamed: size mismatch for %s", kv.first.c_str()); return false;
++        }
++        newmap.emplace(kv.first, d);
++        jobs.push_back({d, data_off + gguf_get_tensor_offset(gguf_, tid), host});
++        if (host) ++n_host; else { ++n_dev; if (ggml_nbytes(d) > max_dev) max_dev = ggml_nbytes(d); }
++    }
++    gpu_buf_ = ggml_backend_alloc_ctx_tensors(device_ctx_, backend);
++    if (!gpu_buf_){ LA_LOG("offload_streamed: device alloc failed"); return false; }
++    if (n_host > 0) {
++        host_buf_ = ggml_backend_alloc_ctx_tensors_from_buft(host_ctx_, ggml_backend_cpu_buffer_type());
++        if (!host_buf_){ LA_LOG("offload_streamed: host alloc failed"); return false; }
++    }
++
++    FILE* f = std::fopen(path_.c_str(), "rb");
++    if (!f){ LA_LOG("offload_streamed: cannot reopen %s", path_.c_str()); return false; }
++    std::vector<unsigned char> staging(max_dev);
++    bool ok = true;
++    for (auto& j : jobs) {
++        const size_t nb = ggml_nbytes(j.dst);
++        void* dst = j.host ? j.dst->data : staging.data();
++        if (fseeko(f, (off_t)j.off, SEEK_SET) != 0 || std::fread(dst, 1, nb, f) != nb){
++            LA_LOG("offload_streamed: read failed for %s", ggml_get_name(j.dst)); ok = false; break;
++        }
++        if (!j.host) ggml_backend_tensor_set(j.dst, staging.data(), 0, nb);
++    }
++    std::fclose(f);
++    if (!ok) return false;
++    tensors_.swap(newmap);   // graphs now reference the device-resident weights
++    LA_LOG("offload_weights: streamed %zu weights -> %s, %zu host-read tensors on CPU",
++           n_dev, dev_name.c_str(), n_host);
++    return true;
++}
++
+ ModelLoader::~ModelLoader(){
+     // Free the device buffer + its metadata ctx BEFORE the host ctx_ (which holds
+     // the host-read tensors and the source bytes the device weights were copied from).
+     if (gpu_buf_)    ggml_backend_buffer_free(gpu_buf_);
+     if (device_ctx_) ggml_free(device_ctx_);
++    if (host_buf_)   ggml_backend_buffer_free(host_buf_);
++    if (host_ctx_)   ggml_free(host_ctx_);
+     if (gguf_) gguf_free(gguf_);
+     if (ctx_)  ggml_free(ctx_);
+ }
+diff --git i/src/model_loader.hpp w/src/model_loader.hpp
+index d95d78f..37b498c 100644
+--- i/src/model_loader.hpp
++++ w/src/model_loader.hpp
+@@ -6,6 +6,7 @@
+ #include <unordered_map>
+ 
+ struct ggml_backend_buffer;
++struct ggml_backend;
+ 
+ namespace la {
+ 
+@@ -34,6 +35,11 @@ public:
+     ModelLoader(ModelLoader&&) = default;
+     ModelLoader& operator=(ModelLoader&&) = default;
+ 
++    // When on, load() reads only metadata (no 4.7 GB host copy of the weights)
++    // and offload_weights() streams each tensor from the file to its final
++    // place. Needed on unified-memory devices (Jetson) where a host copy plus
++    // a device copy does not fit. Must be set before load(); GPU path only.
++    void set_stream_weights(bool on) { stream_weights_ = on; }
+     bool load(const std::string& path);
+     const VitConfig& config() const { return cfg_; }
+     // Returns a tensor owned by this loader's ctx_; valid only while the loader
+@@ -65,6 +71,12 @@ private:
+     // metadata (no_alloc), gpu_buf_ owns the device buffer with the weights.
+     ggml_context* device_ctx_ = nullptr;
+     ggml_backend_buffer* gpu_buf_ = nullptr;
++    // Streaming mode: host_ctx_/host_buf_ hold only the two host-read tensors.
++    bool stream_weights_ = false;
++    std::string path_;
++    ggml_context* host_ctx_ = nullptr;
++    ggml_backend_buffer* host_buf_ = nullptr;
++    bool offload_streamed(struct ggml_backend* backend, const std::string& dev_name);
+ };
+ 
+ }  // namespace la

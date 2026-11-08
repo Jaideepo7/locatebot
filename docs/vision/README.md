@@ -1,6 +1,6 @@
 # Vision: LocateAnything q4_k on the Orin
 
-**Status:** model download and engine build scripts, both tested on an x86 Linux server (CPU build). Not yet run on the Orin; no Python wrapper yet.
+**Status:** runs on the Orin GPU (2026-11-08) with the streamed-weights patch; about 2.1 s per item per 640 px frame. Python wrapper and worker built.
 
 ## Model choice
 `locate-anything-q4_k.gguf` from [mudler/locate-anything.cpp-gguf](https://huggingface.co/mudler/locate-anything.cpp-gguf), pinned to revision `4e50db5`, 4.72 GB, SHA-256 `894088a0…3901da`.
@@ -27,6 +27,23 @@ $CLI detect --model models/locate-anything-q4_k.gguf --input photo.jpg \
   --annotated out.png
 ```
 Record for 5-10 photos of the real items taken with the car's camera: seconds per image (first run and warm), peak RAM, and whether the boxes are right. That decides how often the car can ask the model.
+
+## Orin GPU results (2026-11-08, JetPack R39.2, CUDA sm_87, q4_k)
+**Engine patch required.** Unpatched, the engine keeps the whole 4.7 GB gguf in host RAM and then allocates 3.3 GB more on the GPU; the Orin's 7.3 GB is shared, so `cudaMalloc` fails. `scripts/patches/locate-anything-streamed-weights.patch` (applied by `scripts/build_locate_anything.sh`) streams each weight from the file to the GPU instead. CPU path unchanged; `LA_NO_STREAM_WEIGHTS=1` restores the original GPU load.
+
+**Frame size limits memory and speed.** The vision encoder's attention grows with the square of the patch count: a 1600x900 photo (~7300 patches) needs a 3.8 GB compute buffer on top of the weights and fails. Send 640 px frames.
+
+| Frame | hybrid, warm | fast, warm | Notes |
+|---|---|---|---|
+| 640x360 / 360x640 | 2.14-2.42 s per item | 2.14-2.15 s | all 7 items boxed correctly |
+| 960x540 / 540x960 | 5.14-5.41 s | 5.16-5.21 s | same boxes; fast mode widened the monitor box |
+| 1600x900 | fails (compute buffer OOM) | fails | |
+
+- Model load: about 57 s from the SD card (streamed). First call per run about 1.3 s slower than warm.
+- `fast` is no faster than `hybrid`: the time is the vision encoder, not decoding. Use `hybrid`.
+- Lowest free RAM during the 640/960 run: 1.14 GB. Leave room for mapping and the mission process.
+- CPU fallback (`LA_DEVICE=cpu`) is unusable on the Orin: over 8 min on the first call while swapping.
+- Photos: bolt, dry-erase marker, Stanley tape measure, whiteboard scene (whiteboard, chair, monitor). `bolt` and `screw` both box the bolt.
 
 ## Smoke test results (x86 server, 8 CPU cores, no GPU, CLI)
 Photo: COCO 39769 (two cats, two TV remotes on a sofa), q4_k, default `hybrid` mode.
