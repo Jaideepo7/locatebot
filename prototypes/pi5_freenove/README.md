@@ -52,10 +52,14 @@ These scripts predate reading the repo rules and **do not follow the package inv
 | `laptop/carrun.sh` | Run a command **detached** on the Pi and collect its output (survives Wi-Fi drops, never double-starts) |
 | `laptop/bot.py`, `laptop/step.sh`, `laptop/waitchange.py` | Client for `server.py`: drive + "camera is still" snapshots |
 | `laptop/look.sh`, `laptop/lr_check.py` | Snapshot via SSH; left/right check by image shift (unreliable, see below) |
-| `pi/botd.py`, `pi/restart_botd.sh` | **One daemon that owns the car** (sensors, 20 Hz control loop, camera, missions) and exposes it as HTTP tools for an LLM or a phone page (port 8000): `/state /stop /snap /photos /photo/<f> /look_around /pulses /turn /turn_deg /goto /aim /approach /wander /back /drift /wheel_gain /bins /beep`, plus a question inbox (`POST /ask`, `/inbox`, `POST /claim`, `POST /answer`) and a web page at `/`. Replaces `server.py` + the `motion.py` CLI while it runs |
+| `pi/botd.py`, `pi/restart_botd.sh` | **One daemon that owns the car** (sensors, 20 Hz control loop, camera, missions) and exposes it as HTTP tools for an LLM or a phone page (port 8000): `/state /stop /snap /scan /photos /photo/<f> /look_around /pulses /turn /turn_deg /goto /aim /approach /wander /back /drift /wheel_gain /bins /beep`, plus a question inbox (`POST /ask`, `/inbox`, `POST /claim`, `POST /answer`) and a web page at `/`. Replaces `server.py` + the `motion.py` CLI while it runs |
 | `pi/scanmatch.py`, `pi/turncal.py` | 2D ICP scan matching (rotation + shift between two scans) and a pivot calibration / closed-loop turn tool |
 | `laptop/find.py`, `laptop/seek.py` | Earlier find-and-drive loops (kept for reference; `choose.py` is the one that works) |
 | `laptop/choose.py` | **Find and drive to an object**: `scan "<what>"` → numbered choices + tagged photo sheet; `go N` → orient, drive, arrive (see below) |
+| `pi/web/` | **Phone app** served by `botd.py` at `/` (pixel-art night theme, self-hosted font, installable PWA over https): live camera, hold-to-drive D-pad, Stop, speed, camera look, and "Ask the robot" with live progress and answer photos |
+| `pi/tunnel.sh`, `pi/tunnel_policy.example.yml` | Password-protected public https link to the app via ngrok (runs on the car) |
+| `laptop/qa.py` | The LLM's side of the app inbox: `watch` (blocks until a question arrives: run it in the background as a notification), `claim`, `say` (progress line), `snap`, `answer ID "text" photo.jpg ...` |
+| `laptop/deploy_app.sh`, `laptop/make_qr.py` | Copy the app + daemon to the car and check every endpoint; make a scannable QR card in the app's style |
 | `orin/locate_server.py` | Runs on the Orin: keeps LocateAnything loaded on the GPU and answers `POST /locate?item=...` (JPEG body) with boxes; `GET /health` |
 
 Laptop env: `CAR_SSH` (ssh target, default `car`, an `~/.ssh/config` alias), `CAR_URL` (default `http://raspberrypi.local:8000`), `ORIN_URL` (default `http://orin.local:8091`), `CAR_OUT` (default `./captures`). No addresses or credentials are stored in the repo.
@@ -93,6 +97,21 @@ What made it work (each was a real failure first):
 - **Stop short, then creep.** A detection takes ~1.2 s; driving through it near the target overshoots. Re-aim at > 4°, or a small offset grows into driving past the target.
 - **Clean start:** jump straight to the cruise power from standstill; a slow ramp lets one side start first and twists the car.
 
+## Phone app for demos (2026-11-08)
+`botd.py` serves `pi/web/` at `http://raspberrypi.local:8000/`. Anyone on the same Wi-Fi can watch the camera, drive, or type a request; the LLM handles requests from the laptop:
+```bash
+python3 laptop/qa.py watch                        # in the background: exits (= notification) when a request arrives
+python3 laptop/qa.py claim 1
+QA_ID=1 python3 laptop/choose.py scan "yellow drill"   # QA_ID: milestones appear live under the request in the app
+QA_ID=1 python3 laptop/choose.py go 1
+python3 laptop/qa.py answer 1 "Found it ..." finds/choices/final_choice1.jpg
+```
+- **Hold-to-drive** (`/manual?l=&r=`): each call drives ~0.35 s, so the car stops by itself when the finger lifts or the connection drops; power capped at ±0.55; forward is refused when something is within `20 + 50 × power` cm, or when there is **no** distance reading at all; a person driving cancels any mission. Leaving the page or switching tabs sends `/stop`.
+- **Live video** (`/stream`, MJPEG): one shared camera grabber for all viewers, ~6 fps at 960 px (~760 KB/s per viewer). Requests through a tunnel (`X-Forwarded-For` set) or `?size=small` get 480×270 at ~3 fps (~38 KB/s).
+- **Progress and photos**: `POST /progress {id, text}`, `POST /upload?name=` (JPEG body) so answers can show laptop-side photos.
+- **From anywhere** (optional): install the ngrok agent on the car (`~/bin/ngrok`, add your authtoken), copy `pi/tunnel_policy.example.yml` to `~/car/tunnel_policy.yml` with a real password, run `pi/tunnel.sh`; it prints the https link. The app can drive a real robot: always keep the password on.
+- Measured: "Find the yellow drill" typed into the app, about 6 m away. Turned −11° → −1.6° in 3 pulses, drove straight, lost the small target on the move (watchdog stop), rescanned (found at +25°, close), 6 pulses + 3 checked hops, **stopped 30 cm in front** (ultrasonic). ~70 s, all steps shown live in the app.
+
 ## Calibration numbers (2026-11-08)
 - Braked pivot pulse at 0.36 power: 0.04 s ≈ 4°, 0.06 s ≈ 7°, 0.08 s ≈ 10° (first pulse from rest smaller). The LiDAR measures a still-to-still pivot to ~0.1° (ICP noise floor 0.01°) when the turn is small.
 - Straight at 30 %: ~35 cm/s; 0.4 s hop ≈ 9 cm, ±0.8°.
@@ -118,7 +137,7 @@ Keep the wheels off the ground for first runs and a hand near the car; there is 
 
 ## Known problems
 - **No hardware failsafe.** The PCA9685 keeps its last PWM if the process is `kill -9`'d or hangs. Needed before unattended runs: a watchdog that pulls the PCA9685 OE pin or cuts motor power.
-- **Rear clearance is always ~0** in `motion.py` (the LiDAR sees the car's own body behind it), so `avoid` never backs up.
+- LiDAR returns inside the car's own outline (`BODY_*` in `motion.py`) are now ignored: after the remount, 8–14 cm hits at front-left made the front clearance −4 cm, so forward was always "blocked". If the front reads oddly short, check for a loose wire near the LiDAR.
 - **Corner trap:** `wander` spent ~33 s pivoting back and forth between a wall and a cart. Needs an escape rule (several avoids in a few seconds → back up and turn ~150°).
 - Came within ~1–3 cm of a person's dark-trousered legs: people need a camera detector and a larger margin.
 - Some event photos are blurred (taken while still turning).
@@ -126,6 +145,8 @@ Keep the wheels off the ground for first runs and a hand near the car; there is 
 - Battery ADC is uncalibrated.
 - **Going around obstacles is weak.** `choose.py` sidesteps (back up, ~30° toward the LiDAR-open side, short drive, look with the camera) but a small, far target behind an obstacle is often lost. Needs path planning on the LiDAR map.
 - **A remounted LiDAR silently breaks everything:** with the front angle wrong by 180°, the car braked for things behind it, crawled, and the weaker side stalled into a left pivot. Re-check `/bins` after touching the LiDAR.
+- **Fixed: an unpowered or unplugged ultrasonic froze `botd`.** gpiozero's `DistanceSensor` (default `partial=False`) waits forever for a full queue of echoes, which blocked the asyncio loop, so the control loop, missions and `/stop` all hung (seen with the battery switch off). Now `partial=True` (no echo = no update, the reading goes stale), and `/stop` cuts the motors directly before cancelling the mission.
+- `restart_botd.sh` used to report "botd up" while the new process had refused to start (the old one was still shutting down); it now waits for the old process to exit.
 - `botd.py` is not started at boot (run `pi/restart_botd.sh`), and the motor chip occasionally returns I2C `Remote I/O error` (121); the control loop now logs it (`/state.control_err`) and keeps running instead of dying silently.
 - `seek.py`/`find.py` live-LiDAR heading tracking (`/goto` without `visual=1`) is unreliable while moving; use `choose.py`.
 

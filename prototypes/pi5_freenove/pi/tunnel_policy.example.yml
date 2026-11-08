@@ -1,0 +1,8 @@
+# Copy to tunnel_policy.yml on the car (chmod 600) and set a real password. tunnel_policy.yml is git-ignored.
+# Used by tunnel.sh: ngrok asks every visitor for this username/password before they reach the app.
+on_http_request:
+  - actions:
+      - type: basic-auth
+        config:
+          credentials:
+            - "locatebot:CHANGE-ME-12+chars"

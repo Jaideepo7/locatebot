@@ -21,6 +21,7 @@ Tools (GET, JSON unless noted)
   /photos?since=0                          photo log: file, t, tag, sensors
   /photo/<file>                            one photo (JPEG)
   /beep?ms=150
+  /scan                                    newest raw LiDAR scan for the dashboard (deg CCW, 0 = front, metres)
 Command listening
   POST /ask      {"q": "..."} or form q=   queue a question
   /inbox?status=pending                    questions (pending | working | answered | all)
@@ -28,7 +29,7 @@ Command listening
   POST /answer   {"id": n, "text": "...", "photos": ["003_blocked.jpg"]}
   /              web page: ask box, answers with photos, live status, STOP
 """
-import asyncio, json, os, signal, sys, threading, time, warnings
+import asyncio, io, json, os, signal, sys, threading, time, warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 warnings.filterwarnings("ignore")
@@ -39,6 +40,8 @@ from motion import (State, Camera, lidar_thread, sonar_task, control_task, wande
                     photo, hold, nearest_objects, free_bins)
 
 PORT = 8000
+WEB_FILES = {"/manifest.webmanifest": "application/manifest+json", "/sw.js": "text/javascript",
+             "/icon-192.png": "image/png", "/icon-512.png": "image/png", "/app.css": "text/css"}
 HOME = os.path.expanduser("~/car")
 QA_PATH = os.path.join(HOME, "qa.json")
 MAX_WANDER_S, MAX_APPROACH_S, MAX_TURN_S = 180, 10, 1.5
@@ -312,6 +315,22 @@ class Bot:
         await hold(self.st, 0.0, 0.0, 0.25)
         return {"turned": direction, "seconds": secs, "note": "approximate; verify with /snap"}
 
+    def scan_json(self):
+        """Newest scan, shaped like the Orin's /scan.json (valid points only). The RPLIDAR reports
+        clockwise angles; convert to the package frame (counter-clockwise, 0 = car front)."""
+        st = self.st
+        scan = list(getattr(st, "last_scan", None) or [])
+        front = self.car.cal.get("lidar_front_deg", 0.0)
+        a, r = [], []
+        for ang, d in scan:
+            if d < 80:                                       # < 8 cm: the car's own body / noise
+                continue
+            cw = (ang - front + 180) % 360 - 180             # car frame, clockwise (+ = right)
+            a.append(round(-cw, 2) + 0.0); r.append(round(d / 1000.0, 3))
+        return {"seq": st.lidar_scans or None, "stamp_s": getattr(st, "lidar_t", None), "n_beams": len(scan),
+                "n_valid": len(a), "a": a, "r": r, "pose": None, "scans": st.lidar_scans,
+                "front_deg_setting": front}
+
     # ---------- state ----------
     def state(self):
         st = self.st
@@ -328,6 +347,7 @@ class Bot:
             "last_result": self.last_result,
             "front_cm": r(st.clear), "front_source": st.src, "sonar_cm": r(st.sonar_cm),
             "lidar_lane_cm": r(st.lidar_cm), "rear_cm": r(getattr(st, "rear_cm", None)),
+            "lidar_body_hits": getattr(st, "body_hits", None),
             "nearest_lidar_deg_cm": nearest_objects(free_bins(st), k=6),
             "speed_cmd": round(st.cmd, 2), "turn": round(st.turn, 2),
             "heading_err_deg": round(getattr(st, "heading_err", 0.0) or 0.0, 1), "turn_rates": dict(self.TURN_RATE),
@@ -415,6 +435,60 @@ load();setInterval(load,1500);
 </script></body></html>"""
 
 
+class FrameHub:
+    """One camera grabber shared by every /stream viewer; it runs only while someone is watching."""
+    def __init__(self, cam, period=0.16):
+        self.cam, self.period = cam, period
+        self.jpg, self.t, self.viewers, self.running = None, 0.0, 0, False
+        self.cv = threading.Condition()
+        self.small, self.small_t, self.small_lock = None, None, threading.Lock()
+
+    def join(self):
+        with self.cv:
+            self.viewers += 1
+            if not self.running:
+                self.running = True
+                threading.Thread(target=self._run, daemon=True).start()
+
+    def leave(self):
+        with self.cv:
+            self.viewers -= 1
+
+    def wait(self, last_t, timeout=2.0):
+        with self.cv:
+            self.cv.wait_for(lambda: self.t > last_t, timeout=timeout)
+            return (self.jpg, self.t) if self.t > last_t else (None, last_t)
+
+    def small_for(self, jpg, t):
+        """480x270 low-quality copy of a frame (shared by all remote viewers): ~1/8 of the bytes."""
+        with self.small_lock:
+            if self.small_t != t:
+                from PIL import Image
+                im = Image.open(io.BytesIO(jpg)); im.draft("RGB", (480, 270))     # JPEG decodes at 1/2 scale: fast
+                im = im.convert("RGB")
+                if im.size != (480, 270):
+                    im = im.resize((480, 270))
+                buf = io.BytesIO(); im.save(buf, "JPEG", quality=55)
+                self.small, self.small_t = buf.getvalue(), t
+            return self.small
+
+    def _run(self):
+        while True:
+            with self.cv:
+                if self.viewers <= 0:
+                    self.running = False
+                    return
+            t0 = time.time()
+            try:
+                jpg = self.cam.capture_bytes()
+            except Exception:
+                time.sleep(0.5); continue
+            with self.cv:
+                self.jpg, self.t = jpg, time.time()
+                self.cv.notify_all()
+            time.sleep(max(0.0, self.period - (time.time() - t0)))
+
+
 class Handler(BaseHTTPRequestHandler):
     bot = None
 
@@ -440,12 +514,74 @@ class Handler(BaseHTTPRequestHandler):
         f = lambda k, d: float(q.get(k, d))
         try:
             p = u.path
-            if p == "/":
-                return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            if p.startswith("/fonts/") and p.endswith(".woff2"):     # self-hosted fonts: the app works offline
+                path = os.path.join(HOME, "web", "fonts", os.path.basename(p))
+                if os.path.isfile(path):
+                    with open(path, "rb") as fh:
+                        return self._send(200, fh.read(), "font/woff2")
+                return self._send(404, {"ok": False})
+            if p == "/" or p in WEB_FILES:
+                name = "index.html" if p == "/" else p.lstrip("/")
+                path = os.path.join(HOME, "web", name)
+                if os.path.isfile(path):
+                    with open(path, "rb") as fh:
+                        return self._send(200, fh.read(), WEB_FILES.get(p, "text/html; charset=utf-8"))
+                if p == "/":
+                    return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+                return self._send(404, {"ok": False})
+            if p == "/stream":                     # MJPEG live video (~6 fps); ends when the viewer leaves
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                # through the internet tunnel (ngrok sets X-Forwarded-For) send small frames at ~3 fps: the full
+                # 960 px stream is ~760 KB/s per viewer, too much for a tunnel's data allowance
+                small = q.get("size") == "small" or (bool(self.headers.get("X-Forwarded-For")) and q.get("size") != "full")
+                hub = Handler.frames; hub.join(); last = 0.0; sent = 0.0
+                try:
+                    while True:
+                        jpg, last = hub.wait(last)
+                        if jpg is None:
+                            continue
+                        if small:
+                            if last - sent < 0.3:
+                                continue
+                            jpg = hub.small_for(jpg, last); sent = last
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                         + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                finally:
+                    hub.leave()
+            if p == "/manual":                     # hold-to-drive: each call drives ~0.35 s, then auto-stop
+                l = max(-0.55, min(0.55, f("l", 0))); r = max(-0.55, min(0.55, f("r", 0)))
+                if b.mission_name:                 # a person driving overrides any running mission
+                    self._call(b.cancel()); b.log("manual control took over")
+                fwd = l > 0 and r > 0
+                if fwd and b.st.clear is None:              # no LiDAR and no sonar reading: never drive blind
+                    b.st.manual = None
+                    return self._send(200, {"ok": False, "blocked": True, "front_cm": None, "why": "no_sensor"})
+                clear = b.st.clear if b.st.clear is not None else 999
+                if fwd and clear < 20 + 50 * max(l, r):      # faster -> stop further away (40 cm at 40 %)
+                    b.st.manual = None
+                    return self._send(200, {"ok": False, "blocked": True, "front_cm": round(clear)})
+                b.st.manual = (l, r); b.st.manual_until = time.time() + 0.35
+                return self._send(200, {"ok": True, "front_cm": round(clear)})
+            if p == "/pan":
+                deg = max(-35.0, min(35.0, f("deg", 0)))
+                b.car.pwm.set_pulse_us(8, int(1500 - deg * 14.3))
+                return self._send(200, {"ok": True, "pan_deg": deg})
             if p == "/state":
                 return self._send(200, b.state())
-            if p == "/stop":
-                self._call(b.cancel()); b.log("STOP (operator)")
+            if p == "/stop":                      # cut the motors directly first: works even if the loop is stuck
+                b.st.manual = None; b.st.target = 0.0; b.st.turn = 0.0
+                b.car.stop()
+                try:
+                    self._call(b.cancel(), timeout=3)
+                except Exception:
+                    b.log("STOP: control loop did not answer (motors were cut directly)")
+                    return self._send(200, {"ok": True, "stopped": True, "loop_ok": False})
+                b.log("STOP (operator)")
                 return self._send(200, {"ok": True, "stopped": True})
             if p == "/wander":
                 secs, spd = min(f("seconds", 60), MAX_WANDER_S), min(f("speed", 40), 60)
@@ -488,6 +624,8 @@ class Handler(BaseHTTPRequestHandler):
                 secs = max(0.05, min(f("seconds", 0.3), MAX_TURN_S))
                 self._call(b.start("turn", lambda: b.turn(d, secs)))
                 return self._send(200, self._call(self._wait(5), timeout=8))
+            if p == "/scan":                       # newest raw LiDAR scan for the dashboard radar, in the
+                return self._send(200, b.scan_json())  # PACKAGE frame: degrees CCW (+ = left), 0 = car front, metres
             if p == "/bins":                       # every 10-deg LiDAR slice (car frame, + = right): nearest cm
                 bins = getattr(b.st, "bins", {}) or {}
                 return self._send(200, {"front_deg_setting": b.car.cal.get("lidar_front_deg"),
@@ -560,6 +698,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         b = self.bot
+        if urlparse(self.path).path == "/upload":     # raw JPEG body -> saved next to the run photos
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            name = os.path.basename(q.get("name", "upload_%d.jpg" % int(time.time() * 1000)))
+            if not name.endswith(".jpg"):
+                name += ".jpg"
+            n = int(self.headers.get("Content-Length") or 0)
+            if not 0 < n <= 6_000_000:
+                return self._send(400, {"ok": False, "error": "need a JPEG body < 6 MB"})
+            with open(os.path.join(b.outdir, name), "wb") as fh:
+                fh.write(self.rfile.read(n))
+            return self._send(200, {"ok": True, "name": name})
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(min(n, 65536)).decode("utf-8", "replace")
         if "json" in (self.headers.get("Content-Type") or ""):
@@ -574,6 +723,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, b.ask(data.get("q", "")))
         if p == "/claim":
             return self._send(200, b.set_q(data.get("id", 0), status="working"))
+        if p == "/progress":                       # live progress line on a question (shown in the app)
+            with b.qa_lock:
+                for item in b.qa:
+                    if item["id"] == int(data.get("id", 0)):
+                        item.setdefault("progress", []).append(time.strftime("%H:%M:%S ") + str(data.get("text", ""))[:300])
+                        item["status"] = "working"
+                        b._save_qa()
+                        return self._send(200, {"ok": True})
+            return self._send(404, {"ok": False, "error": "no such question"})
         if p == "/answer":
             photos = [os.path.basename(x) for x in (data.get("photos") or [])][:6]
             return self._send(200, b.set_q(data.get("id", 0), status="answered",
@@ -591,6 +749,7 @@ async def main():
     loop = asyncio.get_running_loop()
     bot = Bot(loop)
     Handler.bot = bot
+    Handler.frames = FrameHub(bot.st.cam)
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     stop_ev = asyncio.Event()

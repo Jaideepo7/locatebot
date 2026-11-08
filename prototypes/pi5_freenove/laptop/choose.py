@@ -16,8 +16,19 @@ OUT = os.path.join("finds", "choices")
 F_PX = 1290.0                                  # measured focal length at 960 px (HFOV 40.8 deg)
 
 
+QA_ID = os.environ.get("QA_ID")                 # set -> main steps also appear live in the phone app
+
+
 def log(m, _t0=[time.time()]):
     print(f"{time.time()-_t0[0]:6.1f}s {m}", flush=True)
+    if QA_ID and not m.startswith("    "):     # milestones only, not every check
+        try:
+            import urllib.request
+            r = urllib.request.Request(CAR + "/progress", json.dumps({"id": int(QA_ID), "text": m.strip()}).encode(),
+                                       {"Content-Type": "application/json"})
+            urllib.request.urlopen(r, timeout=2).read()
+        except Exception:
+            pass
 
 
 def pan_of(name):

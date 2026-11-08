@@ -24,6 +24,9 @@ BRAKE_S = 0.15           # active short-brake duration when we have to stop whil
 MIN_DUTY_MOTION = 700    # lower floor than car.py so "slow" is actually slow
 HALF_WIDTH_CM = 13.0     # half the car width + margin: lane that must be clear
 LIDAR_TO_FRONT_CM = 12.0 # LiDAR centre -> front bumper (estimate)
+# the car's own outline around the LiDAR: returns inside it are the car (2026-11-08: 8-14 cm hits at front-left
+# made front clearance -4 cm, so forward was always "blocked"). The front sonar still covers the bumper zone.
+BODY_FRONT_CM, BODY_REAR_CM, BODY_HALF_CM = LIDAR_TO_FRONT_CM + 1.5, 12.0, 11.5
 ACCEL = 0.5              # power units per second when speeding up (gentle: hard starts made the car slip/drift)
 DECEL = 3.0              # power units per second when slowing down
 HZ = 20
@@ -53,7 +56,7 @@ def lidar_thread(st, front_deg):
         for scan in lid.scans():
             if not st.running:
                 break
-            best, rear = 999.0, 999.0
+            best, rear, body = 999.0, 999.0, 0
             bins = {}                              # car-frame slice centre (deg, + = right) -> nearest cm
             for a, d in scan:
                 if d < 80:                         # < 8 cm: self-hits / noise
@@ -61,6 +64,9 @@ def lidar_thread(st, front_deg):
                 rel = (a - front_deg + 180) % 360 - 180
                 th = math.radians(rel)             # clockwise angles: +y = right
                 x, y = d * math.cos(th) / 10.0, d * math.sin(th) / 10.0
+                if -BODY_REAR_CM < x < BODY_FRONT_CM and abs(y) < BODY_HALF_CM:
+                    body += 1                      # inside the car's own outline: a wire / the chassis, not an obstacle
+                    continue
                 if x > 0 and abs(y) < HALF_WIDTH_CM:
                     best = min(best, x - LIDAR_TO_FRONT_CM)
                 if x < 0 and abs(y) < HALF_WIDTH_CM:
@@ -68,7 +74,7 @@ def lidar_thread(st, front_deg):
                 b = int(round(rel / 10.0)) * 10
                 bins[b] = min(bins.get(b, 9999.0), d / 10.0)
             st.bins = {b: bins.get(b, UNKNOWN_CM) for b in range(-180, 181, 10)}
-            st.lidar_cm = best; st.rear_cm = rear
+            st.lidar_cm = best; st.rear_cm = rear; st.body_hits = body
             st.last_scan = scan                    # raw points for scan matching (measured turns)
             st.lidar_t = time.time(); st.lidar_scans += 1
     except Exception as e:
@@ -79,12 +85,15 @@ def lidar_thread(st, front_deg):
 
 async def sonar_task(st):
     from gpiozero import DistanceSensor
-    s = DistanceSensor(echo=22, trigger=27, max_distance=3, queue_len=2)
+    # partial=True: never block. With partial=False gpiozero waits for a full queue of echoes, so an unpowered
+    # or unplugged sensor froze the whole event loop (control loop, STOP, missions) - seen 2026-11-08.
+    s = DistanceSensor(echo=22, trigger=27, max_distance=3, queue_len=2, partial=True)
     try:
         while st.running:
             d = s.distance * 100
-            st.sonar_cm = d if d < 295 else 999.0
-            st.sonar_t = time.time()
+            if d > 0.5:                     # 0.0 = no echo yet / sensor dead -> no update, reading goes stale
+                st.sonar_cm = d if d < 295 else 999.0
+                st.sonar_t = time.time()
             await asyncio.sleep(1 / 15)
     finally:
         s.close()
