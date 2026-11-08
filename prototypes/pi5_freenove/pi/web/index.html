@@ -302,7 +302,7 @@ async function poll() {
     const s = await api("/state"); lastOk = Date.now();
     const front = s.front_cm == null || s.front_cm > 500 ? "Front clear" : `Front ${Math.round(s.front_cm)} cm`;
     chip($("#conn"), "Live", "live");
-    const m = driving ? "You're driving" : s.mission ? (MISSION[s.mission] || "Claude is driving") : "Idle";
+    const m = driving ? "You're driving" : s.mission ? (MISSION[s.mission] || "Nvidia Nemotron Super 3.5 VL is driving") : "Idle";
     chip($("#mode"), m, driving || s.mission ? "busy" : "");
     $("#hud-mode").textContent = m; $("#hud-front").textContent = front;
     wandering = s.mission === "wander";
@@ -474,7 +474,7 @@ async function ask(q) {
 }
 $("#askForm").onsubmit = e => { e.preventDefault(); ask($("#askInput").value); };
 document.querySelectorAll(".ideas button").forEach(b => b.onclick = () => ask(b.dataset.q));
-const STATUS = {pending: "Waiting for Claude", working: "Claude is on it", answered: "Done"};
+const STATUS = {pending: "Waiting for Nvidia Nemotron Super 3.5 VL", working: "Nvidia Nemotron Super 3.5 VL is on it", answered: "Done"};
 function step(p) {
   const m = /^(\d\d:\d\d:\d\d) (.*)$/s.exec(p);
   return m ? `<li><span><time>${m[1]}</time>${esc(m[2])}</span></li>` : `<li><span>${esc(p)}</span></li>`;
@@ -488,10 +488,10 @@ async function loadFeed() {
       <div class="qhead"><span class="qn">#${x.id}</span><p class="qq">${esc(x.q)}</p><span class="qt">${esc(x.asked)}</span></div>
       <p class="qs">${x.status === "working" ? '<span class="spin"></span>' : ""}${STATUS[x.status] || esc(x.status)}</p>
       ${(x.progress || []).length ? `<ol class="steps">${x.progress.map(step).join("")}</ol>` : ""}
-      ${x.answer ? `<div class="scroll px"><p class="by">Claude</p><p>${esc(x.answer)}</p>
+      ${x.answer ? `<div class="scroll px"><p class="by">Nvidia Nemotron Super 3.5 VL</p><p>${esc(x.answer)}</p>
         ${(x.photos || []).length ? `<div class="photos">${x.photos.map(f => `<button class="px" data-src="/photo/${encodeURIComponent(f)}" aria-label="Open photo"><img loading="lazy" src="/photo/${encodeURIComponent(f)}" alt=""></button>`).join("")}</div>` : ""}
       </div>` : ""}
-    </article>`).join("") || `<p class="empty">Nothing asked yet. Type something to find, like the orange box, and Claude will drive the robot to it.</p>`;
+    </article>`).join("") || `<p class="empty">Nothing asked yet. Type something to find, like the orange box, and Nvidia Nemotron Super 3.5 VL will drive the robot to it.</p>`;
   if (html !== lastFeed) {
     $("#feed").innerHTML = html; lastFeed = html;
     document.querySelectorAll(".steps").forEach(s => s.scrollTop = s.scrollHeight);
