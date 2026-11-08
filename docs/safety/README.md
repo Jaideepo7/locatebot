@@ -14,11 +14,15 @@ Call it every control tick on the Pi with the newest scan and drive command (bot
 - Clearance ≤ `stop_distance_m` stops; up to `slow_distance_m` the throttle cap rises linearly to `max_speed`. Requested speed is never raised.
 - Reverse is always blocked (no rear policy yet). Zero throttle on a healthy scan is allowed (steer in place).
 
+## Corridor coverage needs dense scans
+The corridor gate needs a valid return in every ~2° bin, so a LiDAR with beam spacing coarser than about 1.9° can never pass it. The RPLIDAR C1 (~0.07° spacing) is far above that, but glossy or black surfaces, or open space beyond 12 m straight ahead, can empty a bin and stop the car. Measure how often `LOW_COVERAGE` fires on clean scans on the real car; if it is too often, add hysteresis (N consecutive bad scans) for the coverage stop only. Never relax the obstacle stop.
+
 ## Before trusting it on the car
 The defaults (0.40 m stop, 1.0 m slow, 0.5 s scan / 0.3 s command timeouts, 0.15 m half-width) are placeholders.
 1. Measure braking distance at the capped speed and set `stop_distance_m` from it plus sensing latency and margin.
 2. Measure the car's width and set `half_width_m`.
 3. Unplug / freeze the LiDAR and confirm the motors stop, with a physical kill switch in hand.
 4. Test turns towards soft obstacles at low speed.
+5. Record the `LOW_COVERAGE` rate while driving slowly in the demo room.
 
 Limits: 2D scan misses obstacles above/below the LiDAR plane, glass and drop-offs; the rotated corridor approximates the swept arc; a driver that invents fresh timestamps can't be detected from scan age alone.
