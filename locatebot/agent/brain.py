@@ -31,7 +31,7 @@ from locatebot.mission.types import SkillCall, SkillName, SkillState, WorldState
 
 from .llm import LLMClient, LLMError, LLMTimeout
 from .summary import format_call, one_line, render_world_state
-from .tools import InvalidSkillCall, parse_tool_call, tool_definitions, validate_skill_call
+from .tools import CONTINUE_TOOL, InvalidSkillCall, parse_tool_call, tool_definitions, validate_skill_call
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +56,8 @@ the items the operator listed under "looking for".
 - An item marked unconfirmed may be a false detection; prefer confirmed items for go_to and \
 follow.
 - Directions are relative to the robot (left/right/behind); positions are map metres.
+- When you are woken while a skill is running and it is still the right thing to do, call \
+`continue`. Calling the running skill again restarts it from scratch.
 - Add a one-sentence `reason` to each call; the operator sees it.
 Always answer with a tool call.
 """
@@ -400,6 +402,11 @@ class Brain:
             if not err and choice is None:
                 err = "no tool call"
             call = None
+            if not err and choice.name == CONTINUE_TOOL:
+                if self._ws is not None and self._ws.skill.state in BUSY:
+                    self._continue(req, now, one_line(choice.text, 200))
+                    return
+                err = "continue, but no skill is running"
             if not err:
                 try:
                     call = parse_tool_call(choice.name, choice.args, source="llm",
@@ -409,7 +416,25 @@ class Brain:
             if err:
                 self._fail(err, now)
                 return
+            running = self._ws.skill if self._ws is not None else None
+            if (running is not None and running.state == SkillState.RUNNING and running.call is not None
+                    and running.call.name == call.name and dict(running.call.args) == dict(call.args)):
+                self._continue(req, now, "same skill as the one running")  # don't restart it
+                return
             self._succeed(call, req, now)
+
+    def _continue(self, req: _Request, now: float, why: str) -> None:
+        """The LLM chose to let the running skill go on: a successful answer, nothing to emit."""
+        self._failures = 0
+        if self._in_fallback:
+            log.info("LLM answered again; leaving fallback (current step keeps running)")
+            self._in_fallback = False
+            self._fb_index = None
+            self._fb_emitted = None
+            self._want = ""
+        if self._want_seq == req.want_seq:
+            self._want = ""
+        self._history.append(Decision(now, None, "continue" + (f": {why}" if why else "")))
 
     def _fail(self, err: str, now: float) -> None:
         self._failures += 1

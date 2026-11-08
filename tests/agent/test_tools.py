@@ -16,7 +16,7 @@ from locatebot.mission.types import SKILL_ARGS, SkillCall, SkillName
 
 def test_one_tool_per_skill_with_json_schema():
     tools = tool_definitions()
-    assert [t["name"] for t in tools] == [s.value for s in SkillName]
+    assert [t["name"] for t in tools] == [s.value for s in SkillName] + ["continue"]
     json.dumps(tools)  # serialisable
     for t in tools:
         assert set(t) == {"name", "description", "input_schema"}
@@ -24,6 +24,9 @@ def test_one_tool_per_skill_with_json_schema():
         schema = t["input_schema"]
         assert schema["type"] == "object"
         assert schema["additionalProperties"] is False
+        assert "reason" in schema["properties"]
+        if t["name"] == "continue":
+            continue  # not a skill: keeps the running skill going
         skill = SkillName(t["name"])
         for arg in SKILL_ARGS[skill]:
             assert arg in schema["properties"]

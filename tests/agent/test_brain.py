@@ -306,3 +306,42 @@ def test_bad_config():
         Brain(None, max_failures=0)
     with pytest.raises(ValueError):
         Brain(None, fallback_routine=[])
+
+
+# ---------------------------------------------------------------- "continue": keep the running skill
+SEARCH = SkillCall(SkillName.SEARCH, {"items": ["marker", "bolt"]}, "", "llm")
+
+
+def test_continue_while_running_is_a_success_and_emits_nothing():
+    b, llm, clk, out = make([ToolChoice("continue", {}, "keep searching")], default=ToolChoice("continue", {}))
+    running = ws(stamp=1, state=SkillState.RUNNING, call=SEARCH)
+    b.on_world_state(running)
+    b.on_world_state(ws(stamp=2, state=SkillState.RUNNING, call=SEARCH, items=(item("bolt", confirmed=True),)))
+    settle(b)
+    assert out == []
+    st = b.status()
+    assert st["failures"] == 0 and st["in_fallback"] is False
+    assert any("continue" in h for h in (d if isinstance(d, str) else str(d) for d in st["history"]))
+
+
+def test_continue_with_nothing_running_is_a_failure():
+    b, llm, clk, out = make([ToolChoice("continue", {})])
+    b.on_world_state(ws(stamp=1))
+    settle(b)
+    assert out == [] and b.status()["failures"] == 1
+    assert "no skill is running" in b.status()["last_error"]
+
+
+def test_recalling_the_running_skill_does_not_restart_it():
+    b, llm, clk, out = make([ToolChoice("search", {"items": ["marker", "bolt"]})])
+    b.on_world_state(ws(stamp=1, state=SkillState.RUNNING, call=SEARCH))
+    settle(b)
+    assert out == [] and b.status()["failures"] == 0
+
+
+def test_continue_tool_is_offered_and_prompt_explains_it():
+    b, llm, clk, out = make([GO_MARKER])
+    b.on_world_state(ws(stamp=1))
+    settle(b)
+    assert "continue" in {t["name"] for t in llm.calls[0][2]}
+    assert "`continue`" in DEFAULT_SYSTEM_PROMPT

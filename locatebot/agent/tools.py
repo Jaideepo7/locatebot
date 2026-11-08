@@ -91,11 +91,21 @@ def _build_definitions() -> list[dict]:
     return tools
 
 
-_TOOLS = _build_definitions()
+CONTINUE_TOOL = "continue"
+_CONTINUE_DEF = {
+    "name": CONTINUE_TOOL,
+    "description": ("Let the skill that is running now keep going, unchanged. Use this when you are "
+                    "woken by news (an item found, an event) but the running skill is still the right "
+                    "one. Re-calling the running skill would restart it from scratch."),
+    "input_schema": {"type": "object", "properties": {
+        "reason": {"type": "string", "description": "One sentence for the operator."}},
+        "additionalProperties": False},
+}
+_TOOLS = _build_definitions() + [_CONTINUE_DEF]
 
 
 def tool_definitions() -> list[dict]:
-    """Fresh copy of the tool list, one tool per ``SkillName`` in enum order."""
+    """Fresh copy of the tool list: one tool per ``SkillName`` in enum order, then ``continue``."""
     return copy.deepcopy(_TOOLS)
 
 
