@@ -70,6 +70,7 @@ class OrinRuntime:
         self.executor = executor
         self.brain = brain            # locatebot.agent.brain.Brain or None (operator-only)
         self.vision = vision          # locatebot.vision.service.VisionService or None
+        self.missions = None          # locatebot.orin.missions.MissionBridge or None (Pi missions)
         self.config = config or RuntimeConfig()
         self.clock = clock
         self.tracker = ItemTracker(merge_radius_m=self.config.merge_radius_m,
@@ -186,6 +187,11 @@ class OrinRuntime:
             self.vision.set_items(list(items))
         if self.brain is not None:
             self.brain.on_world_state(ws)
+        if self.missions is not None:  # outside our lock: the bridge calls set_goal/submit_operator
+            try:
+                self.missions.tick(now, ws)
+            except Exception:
+                log.exception("mission bridge tick failed")
         return out
 
     def world_state(self, now: float | None = None) -> WorldState:
@@ -233,4 +239,6 @@ class OrinRuntime:
             out["brain"] = self.brain.status()
         if self.vision is not None:
             out["vision"] = self.vision.status()
+        if self.missions is not None:
+            out["missions"] = self.missions.status()
         return out

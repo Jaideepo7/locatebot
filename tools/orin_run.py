@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,9 +103,12 @@ def pi_source(app: OrinApp, stop: threading.Event, host: str, clock: PeerClock) 
     from locatebot.lidar.types import Scan
     from locatebot.link.messages import Frame, PiStatus
     from locatebot.link.transport import Subscriber, pi_pub_endpoint
-    with Subscriber(pi_pub_endpoint(host), ["scan", "frame", "pi_status"], newest_only=("frame",)) as sub:
+    topics = ["scan", "frame", "pi_status", "mission_request", "mission_cancel"]  # missions: never newest-only
+    with Subscriber(pi_pub_endpoint(host), topics, newest_only=("frame",)) as sub:
         while not stop.is_set():
             for msg in sub.poll(0.2):
+                if app.runtime.missions is not None and app.runtime.missions.on_message(msg):
+                    continue
                 if isinstance(msg, Scan):
                     clock.observe(msg.stamp_s)
                     app.on_scan(msg)
@@ -128,11 +132,18 @@ class PiDriveSink:
         self.seq = 0
         self.last_status = 0.0
         self.boot_id = BOOT_ID
+        self._queue = deque()  # MissionStatus from the control thread; only this sink's thread sends
+
+    def queue(self, msg) -> None:
+        """Thread-safe: hand a message (e.g. MissionStatus) to the sender thread."""
+        self._queue.append(msg)
 
     def __call__(self, throttle: float, steering: float) -> None:
         from locatebot.link.messages import DriveCmd, OrinStatus
         self.seq += 1
         self.pub.send(DriveCmd(float(throttle), float(steering), self.seq, time.monotonic()))
+        while self._queue:
+            self.pub.send(self._queue.popleft())
         now = time.monotonic()
         if now - self.last_status >= 1.0:
             self.last_status = now
@@ -224,6 +235,9 @@ def main(argv=None) -> int:
     sim = SimSource(vehicle) if args.sim else None
     sink = sim.drive if sim else (PiDriveSink(runtime) if args.pi_host else DryRunSink())
     app = OrinApp(runtime, sink, clock=clock, config=AppConfig(maps_dir=args.maps_dir))
+    if args.pi_host:  # Telegram/operator missions from the Pi (docs/remote/README.md)
+        from locatebot.orin.missions import MissionBridge
+        runtime.missions = MissionBridge(runtime, sink.queue)
 
     stop = threading.Event()
     if sim:

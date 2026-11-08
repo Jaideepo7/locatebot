@@ -39,6 +39,13 @@ The brain wakes the LLM on events (an item confirmed, a skill ended, a safety st
 ## Goal (R4)
 `OrinRuntime.set_goal(text, source="operator")` / `clear_goal()` hold what the operator (or, from R3, a Telegram customer) wants, e.g. "find the bolt". It is validated (`normalize_goal`), timestamped, thread-safe, recorded as an event (`goal set: ... (by operator)` / `goal cleared`) and put into `WorldState.goal`, which the LLM sees as the first line of its state. A new goal wakes the brain. An operator STOP still pauses the brain: setting a goal does not resume it (`/resume` does).
 
+## Mission bridge (R3, `locatebot/orin/missions.py`)
+`MissionBridge(runtime, publish, clock=time.time)` turns Telegram/operator missions from the Pi into skills. `tools/orin_run.py --pi-host` wires it: `pi_source` subscribes `mission_request` / `mission_cancel` (not newest-only) and calls `on_message`; `OrinRuntime.step` calls `bridge.tick(now, ws)` after the brain (outside the runtime lock; never blocks); statuses go into `PiDriveSink.queue` and are sent by the drive-sender thread, which owns the PUB socket.
+- Validation (from `JetsonAgent`): expired, more than 5 s in the future, `expires <= issued`, or a second concurrent mission → `FAILED` with `EXPIRED` / `CLOCK_SKEW` / `INVALID_EXPIRY` / `BUSY`; a duplicate id gets its last status again.
+- Start: `set_goal("find <target>", source="mission")`; with a brain it acts (approve/auto; a paused brain is resumed); without one the routine runs `search([target])`, then `go_to(item=target)`; a lost target re-searches at most twice.
+- Status mapping, cancel and link loss: see the table in `docs/remote/README.md`. Target matching: case-insensitive exact item name, so wording matters (short nouns, `docs/vision/README.md`).
+- `runtime.status()["missions"]`: active mission (id, target, state, step, link_down, expires_in_s), `link_up`, counters.
+
 ## Timing (measured)
 | Per tick | x86 laptop | Orin Nano CPU |
 |---|---|---|
