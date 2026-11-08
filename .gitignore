@@ -16,3 +16,6 @@ maps/*.lbmap
 maps/*.pgm
 maps/*.yaml
 maps/*.png
+
+# Remote-control mission database (DISPATCH_DB_PATH)
+dispatch.db*

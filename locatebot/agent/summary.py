@@ -2,6 +2,7 @@
 
 Output is bounded: at most ``MAX_ITEMS_LISTED`` item lines, free-text fields are flattened to
 one line and truncated. Directions are in the robot frame (bearing CCW positive = left).
+The first line is always the goal (``goal: <text>`` or ``goal: none``).
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from locatebot.mission.types import ItemView, SkillCall, SkillState, WorldState
 MAX_ITEMS_LISTED = 6
 MAX_TEXT_CHARS = 120
 MAX_NAME_CHARS = 24
+MAX_GOAL_CHARS = 200
 AHEAD_DEG = 5.0      # |bearing| at or below this reads "ahead"
 BEHIND_DEG = 135.0   # |bearing| at or above this reads "behind (...)"
 
@@ -142,6 +144,7 @@ def render_world_state(ws: WorldState) -> str:
     else:
         explored = f"{100.0 * min(max(ws.explored_frac, 0.0), 1.0):.0f} %"
     lines = [
+        f"goal: {one_line(getattr(ws, 'goal', ''), MAX_GOAL_CHARS) or 'none'}",
         f"pose: ({p.x:.1f}, {p.y:.1f}) m, heading {heading:.0f}°   explored: {explored}   "
         f"mission: {one_line(ws.mission_state, 40)}   safety: {one_line(ws.safety_reason, 40)}"
     ]

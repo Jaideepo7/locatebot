@@ -34,7 +34,7 @@ def build_world_state(*, now: float, pose: Pose2D, scan: Scan | None, tracker: I
                       skill: SkillStatus, search_items: tuple[str, ...] = (),
                       explored_frac: float | None = None, safety_reason: str = "ok",
                       mission_state: str = "idle", last_event: str = "", n_sectors: int = 8,
-                      max_items: int = 12) -> WorldState:
+                      max_items: int = 12, goal: str = "") -> WorldState:
     if scan is not None:
         sectors = tuple(float(v) for v in sector_clearance(scan, n_sectors))
     else:
@@ -43,4 +43,4 @@ def build_world_state(*, now: float, pose: Pose2D, scan: Scan | None, tracker: I
         stamp_s=now, pose=pose, sector_clearance_m=sectors, explored_frac=explored_frac,
         items=_item_views(tracker, pose, now, max_items), skill=skill,
         search_items=tuple(search_items), safety_reason=safety_reason,
-        mission_state=mission_state, last_event=last_event)
+        mission_state=mission_state, last_event=last_event, goal=goal)

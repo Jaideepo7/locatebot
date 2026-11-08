@@ -5,7 +5,7 @@ The LLM decides *what* the robot does next by calling one skill tool; Nav-lite d
 ## Modules
 | File | API |
 |---|---|
-| `summary.py` | `render_world_state(ws) -> str`: pose/heading, explored %, mission, safety; sector clearances (8 sectors named front, front-left, …; other counts in degrees; NaN/inf = `unknown`); up to 6 items (confirmed first, then most recent) with range, bearing (`30° left`, `behind (170° right)`), age; skill line; last event. Deterministic, one-line fields, truncated. |
+| `summary.py` | `render_world_state(ws) -> str`: first line `goal: <text>` (or `goal: none`, ≤ 200 chars, one line); pose/heading, explored %, mission, safety; sector clearances (8 sectors named front, front-left, …; other counts in degrees; NaN/inf = `unknown`); up to 6 items (confirmed first, then most recent) with range, bearing (`30° left`, `behind (170° right)`), age; skill line; last event. Deterministic, one-line fields, truncated. |
 | `tools.py` | `tool_definitions()` -> `[{"name","description","input_schema"}]`, one per `SkillName`, JSON Schema with `additionalProperties: false` and an optional `reason` string. `parse_tool_call(name, args, source="llm") -> SkillCall` raises `InvalidSkillCall`. `validate_skill_call(call)` re-checks operator/fallback calls. |
 | `llm.py` | `LLMClient` protocol: `decide(system, user, tools, timeout_s) -> ToolChoice(name, args, text) \| None`. `ClaudeClient`, `OpenAICompatClient`, `FakeLLM`. Errors: `LLMError(status, retryable)`, `LLMTimeout`. |
 | `brain.py` | `Brain(llm, mode=..., ...)`: `on_world_state(ws)`, `poll()`, `pending()`, `approve()`, `reject()`, `submit_operator(call)`, `resume()`, `set_mode()`, `status()`, `history()`, `wait_idle()`. |
@@ -18,8 +18,17 @@ Unknown skill, non-object args, unknown or missing args → rejected. Strings: n
 - **`OpenAICompatClient(base_url="http://127.0.0.1:11434/v1", model="qwen2.5:7b-instruct", api_key_env=None)`** for Ollama or llama.cpp server: `POST {base_url}/chat/completions`, tools as `{"type":"function","function":{name, description, parameters}}`, `tool_choice: "auto"`. The model name is a placeholder: pick one that supports tool calls.
 - **Timeouts:** each request runs in a daemon thread with socket timeout = `timeout_s`, and the caller gets `LLMTimeout` at `timeout_s` wall-clock. The Brain also enforces `llm_timeout_s` on its own clock.
 
+## Goal input
+`WorldState.goal` is the request in words ("find the bolt"), set on the Orin with `OrinRuntime.set_goal()` from the operator page (`POST /goal`) or, from R3, a Telegram `/find`. It is the first line of every prompt. Prompt rules added to `DEFAULT_SYSTEM_PROMPT`:
+- work towards the goal; with `goal: none`, keep the robot safe and follow the operator, don't invent a task;
+- choose items to search for from the goal as short common nouns (`"find my keys"` → `search(["keys"])`);
+- when the goal is achieved (e.g. arrived with `go_to`), call `stop` with a reason saying it's done;
+- if it is impossible (search ended without the item, no path), call `stop` and explain in the reason.
+
+Limits: the goal is free text; the LLM does the parsing. There is no multi-step goal tracking ("find the bolt, then come back") beyond what the LLM infers from the state and its decision history, and nothing checks that a `stop` reason really means "done". R3's mission bridge decides mission success from skill results, not from the LLM's words.
+
 ## Brain behaviour
-- **When it asks:** first state; skill entered SUCCEEDED/FAILED/CANCELLED; a newly *confirmed* item; safety reason changed to something other than `ok`/`slowed`; `last_event` changed; or every `decide_interval_s` while idle (no skill running, nothing pending). Triggers that arrive during a request are kept and served after it.
+- **When it asks:** first state; a new non-empty goal (reason `new goal: ...`; clearing the goal is not a trigger by itself, only its `goal cleared` event is, once); skill entered SUCCEEDED/FAILED/CANCELLED; a newly *confirmed* item; safety reason changed to something other than `ok`/`slowed`; `last_event` changed; or every `decide_interval_s` while idle (no skill running, nothing pending). Triggers that arrive during a request are kept and served after it.
 - **One request at a time**, in a background thread. `on_world_state` only takes a short lock and never waits on the LLM.
 - **auto:** a valid call is emitted via `on_skill`. **approve:** it becomes `pending()`. `approve()` emits it, `reject()` drops it, and a newer proposal replaces a stale one (history outcome `replaced`).
 - **Failures:** timeout, `LLMError`, invalid call or no tool call. Each one counts, sets `last_error`, and retries after `retry_delay_s`. After `max_failures` in a row (or with `llm=None`, or `max_abandoned` timed-out threads still alive) the brain enters **fallback**: the routine (default `[STOP]`) runs one step at a time, starting once the current skill is no longer running. It moves to the next step when the world state shows that step's call in a terminal state with a newer `stamp_s`. During fallback the LLM is probed every `decide_interval_s`, and the first valid answer ends fallback and is handled normally.

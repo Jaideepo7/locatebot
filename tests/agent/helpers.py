@@ -15,7 +15,7 @@ def item(name="marker", *, confirmed=True, sightings=5, range_m=1.8, bearing_deg
 
 
 def ws(*, stamp=0.0, state=SkillState.IDLE, call=None, detail="", items=(), sectors=None,
-       safety="ok", event="", mission="searching", explored=0.72, search_items=()):
+       safety="ok", event="", mission="searching", explored=0.72, search_items=(), goal=""):
     if sectors is None:
         sectors = (1.4, 0.5, 2.2, float("nan"), 3.0, 2.5, 1.0, 0.8)
     return WorldState(
@@ -29,6 +29,7 @@ def ws(*, stamp=0.0, state=SkillState.IDLE, call=None, detail="", items=(), sect
         safety_reason=safety,
         mission_state=mission,
         last_event=event,
+        goal=goal,
     )
 
 

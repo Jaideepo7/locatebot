@@ -22,6 +22,8 @@ Operator page (stdlib HTTP, everything inline, no CDN):
 - ``POST /stop``      operator STOP (pauses LLM decisions until ``/resume``)
 - ``POST /approve``, ``POST /reject``, ``POST /resume``, ``POST /mode`` ``{"mode": "approve"|"auto"}``
 - ``POST /save_map``  ``{"name": "room1"}`` -> ``maps/<name>.lbmap/.pgm/.yaml``
+- ``POST /goal``      ``{"text": "find the bolt"}`` goal for the LLM (1-200 chars, 400 if invalid)
+- ``POST /goal/clear`` clear the goal
 
 POST bodies must be ``application/json`` (blocks cross-site form posts). Default bind host is
 127.0.0.1; anyone who can reach the port can command the robot.
@@ -343,6 +345,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "mode": rt.brain.mode})
             if self.path == "/save_map":
                 return self._json(200, {"ok": True, "files": app.save_map(body.get("name", ""))})
+            if self.path == "/goal":
+                goal = rt.set_goal(body.get("text"), source="operator")
+                return self._json(200, {"ok": True, "goal": goal})
+            if self.path == "/goal/clear":
+                rt.clear_goal()
+                return self._json(200, {"ok": True})
             return self._json(404, {"error": "not found"})
         except (ValueError, InvalidSkillCall, json.JSONDecodeError) as e:
             return self._json(400, {"error": str(e)})
@@ -377,7 +385,9 @@ button.go{background:var(--ok);border:0}input,select{background:#222;color:var(-
 <div class="row k" id="mapinfo"></div>
 <div class="row"><input id="mapname" placeholder="map name" size="12"><button id="save">Save map</button></div></section>
 <section>
-<h2>Skill</h2><table id="skill"></table>
+<h2>Goal</h2><div class="row"><span id="goal" class="k">none</span></div>
+<div class="row"><input id="goaltext" placeholder="e.g. find the bolt" size="24" maxlength="200"><button class="go" id="setgoal">Set goal</button><button id="cleargoal">Clear</button></div>
+<h2 style="margin-top:12px">Skill</h2><table id="skill"></table>
 <div id="proposal"><b>LLM proposes:</b> <span id="prop"></span>
 <div class="row"><button class="go" id="approve">Approve</button><button id="reject">Reject</button></div></div>
 <div class="row"><span class="k">LLM:</span><span id="brain">-</span>
@@ -394,6 +404,7 @@ async function post(path,body){const r=await fetch(path,{method:"POST",headers:{
  const j=await r.json().catch(()=>({}));if(!r.ok)alert(j.error||r.status);return j}
 $("stop").onclick=()=>post("/stop");$("approve").onclick=()=>post("/approve");$("reject").onclick=()=>post("/reject");
 $("resume").onclick=()=>post("/resume");
+$("setgoal").onclick=()=>post("/goal",{text:$("goaltext").value});$("cleargoal").onclick=()=>post("/goal/clear");
 $("mode").onclick=async()=>{const m=(window.lastStatus&&window.lastStatus.brain&&window.lastStatus.brain.mode)==="auto"?"approve":"auto";post("/mode",{mode:m})};
 $("send").onclick=()=>{let a={};const t=$("sargs").value.trim();if(t){try{a=JSON.parse(t)}catch(e){alert("args must be JSON");return}}post("/skill",{name:$("sname").value,args:a})};
 $("save").onclick=async()=>{const j=await post("/save_map",{name:$("mapname").value.trim()});if(j.ok)alert("saved "+j.files.lbmap)};
@@ -407,6 +418,7 @@ function draw(){const s=window.lastStatus;if(!s||!imgReady)return;const c=$("map
  const p=s.pose,[u,v]=px(p.x,p.y),th=p.theta_deg*Math.PI/180;g.strokeStyle="#e33";g.fillStyle="#e33";g.lineWidth=2;
  g.beginPath();g.arc(u,v,4,0,7);g.fill();g.beginPath();g.moveTo(u,v);g.lineTo(u+12*Math.cos(th),v-12*Math.sin(th));g.stroke()}
 async function tick(){try{const s=await (await fetch("/status")).json();window.lastStatus=s;$("conn").textContent="live";
+ $("goal").textContent=s.goal?s.goal.text+" (by "+s.goal.source+")":"none";
  const sk=s.skill;rows($("skill"),[["state",sk.state],["skill",sk.call?sk.call.name+" "+JSON.stringify(sk.call.args)+" ("+sk.call.source+")":"-"],
   ["detail",sk.detail||"-"],["explored",s.explored_frac==null?"-":Math.round(s.explored_frac*100)+" %"],["safety",s.safety_reason],
   ["pose",`(${s.pose.x}, ${s.pose.y}) ${s.pose.theta_deg}°`],["drive",`thr ${s.app.command.throttle}  steer ${s.app.command.steering}`],
