@@ -8,6 +8,10 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 hardware = ["pyserial>=3.5"]
 dev = ["pytest>=7"]
+# Off-robot server: Photon webhooks + Jetson WebSocket (httpx is for FastAPI's TestClient)
+backend = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "httpx>=0.27"]
+# On the Jetson: outbound WebSocket to the backend
+robot-link = ["websockets>=12"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

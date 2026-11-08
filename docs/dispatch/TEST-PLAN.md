@@ -10,6 +10,17 @@ The RC car isn't running yet, so every layer is tested against a stand-in for th
 | Network | In-memory transport (L1–L2), then real localhost WebSocket (L3), then the internet (L4–L5) | — |
 | Wall clock | Injected `clock()` so expiry and replay windows are tested exactly, with no sleeps | 1–3 |
 
+## Where each level lives (status 2026-11-07)
+| Level | Automated in | Runs now? |
+|---|---|---|
+| L1 | `tests/dispatch/test_protocol.py`, `test_agent.py`, `test_sink.py`; `tests/backend/test_commands.py`, `test_photon.py`, `test_missions.py`, `test_notifier.py`, `test_robot_link.py`, `test_config.py`, `test_tools.py` | Yes, stdlib + pytest |
+| L1.5 | `tests/backend/test_e2e.py`: E1–E12 plus extra drills, with the real services wired together through an in-memory socket | Yes |
+| L2 | `tests/backend/test_app.py`: FastAPI `TestClient`, the real routes and WebSocket | Skips until `pip install -e '.[backend]'` |
+| L3 | `tests/backend/test_live_socket.py`: real uvicorn + real `websockets` client on localhost; plus the manual 3-terminal run below | Skips until `.[backend,robot-link]` |
+| L4, L5 | Manual checklist below | Needs a Photon project, a tunnel and the Jetson |
+
+Test IDs in the code are noted in comments (e.g. `# W4`) so each case below can be traced to its test.
+
 ## The test levels
 
 **L1 — Unit tests.** No network and no dependencies (`python3 -m unittest discover -s tests -v`). These cover the pure logic: parsing, the signature check, protocol validation, the mission store, the agent state machine and message text. The run is fast and deterministic, and this level holds most of the cases below.
@@ -18,10 +29,11 @@ The RC car isn't running yet, so every layer is tested against a stand-in for th
 
 **L3 — Local end-to-end on one laptop.** Three terminals:
 ```bash
-uvicorn locatebot.backend.app:app --port 8000                 # PHOTON_MODE=console prints replies instead of calling Photon
-python tools/fake_jetson.py --url ws://127.0.0.1:8000/ws/robot --script happy
-python tools/send_fake_webhook.py --text "/find blue toolbox"   # signs with PHOTON_WEBHOOK_SECRET
+uvicorn --factory locatebot.backend.app:create_app --port 8000 --ws-ping-interval 10 --ws-ping-timeout 10
+python tools/fake_jetson.py --url ws://127.0.0.1:8000/ws/robot --script happy   # or not_found|stall|reject, --drop-after 4, --silent
+python tools/send_fake_webhook.py --text "/find blue toolbox"   # signs with PHOTON_WEBHOOK_SECRET; --repeat 3, --customer b, --bad-signature
 ```
+`PHOTON_MODE=console` prints the Telegram replies in terminal 1 instead of calling Photon.
 This proves the real WebSocket code, reconnect logic and timing. Kill the fake Jetson mid-mission (Ctrl-C) to test disconnects.
 
 **L4 — Real Photon + Telegram, fake robot.** The backend runs on a laptop behind a public HTTPS tunnel. Photon blocks localhost, so the tunnel is required (any HTTPS tunnel works). Set it as the webhook destination URL. Message the bot from a real Telegram account while `fake_jetson.py` plays the scripts. This is the only level that proves Photon's real payload, signatures and reply `senderId`. Capture one real delivery as a fixture for L1 (remove personal data first).

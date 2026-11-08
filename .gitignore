@@ -9,3 +9,4 @@ maps/private/
 .env
 models/
 third_party/
+dispatch.db*
