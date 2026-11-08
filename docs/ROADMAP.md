@@ -30,7 +30,9 @@ LiDAR driver (verified on the real C1), mapping + `.lbmap`, scan matching, safet
 
 ---
 
-## Step C — contracts first (integrator, ~1 h, before parallel work)
+## Step C — contracts first (integrator, ~1 h, before parallel work) — DONE
+**Done** on branch `contracts/step-c`: `a4e5ee0` (link), `ddc1dc7` (safety), `887cc72` (mission), `57424bd` (build). Additions beyond the list below: `ChangeView` + `WorldState.changes` (M2) and `WorldState.notes` (M3); `PersonView` also has `moving` and `last_seen_age_s`. The `storage = []` extra was not added (no dependency). Note: search items are now a tuple, but `SkillCall` itself is still not hashable because `args` is a `dict`; hash `(call.name, tuple(sorted(call.args.items())))` if you need a key. Field rules: `docs/link/README.md`.
+
 **C1. `locatebot/link/messages.py`**: add
 - `Range` (Pi → Orin): `stamp_s`, `sensor` ("front_ultrasonic"), `range_m` (null = no echo), `fov_rad`. Topic `range`.
 - `MissionRequest` (Pi → Orin): `mission_id`, `target` (normalised text), `issued_s`, `expires_s`. Topic `mission_request`.
