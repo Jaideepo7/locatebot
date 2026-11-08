@@ -144,6 +144,9 @@ class LayeredMap:
         self._blobs: list[_Blob] = []
         self._next_id = 1
         self._t: float | None = None
+        # this scan's NEW-point clusters (map-frame centroid, width_m, n_points), promoted blobs
+        # left out: the people tracker's input (M3)
+        self.last_clusters: list[tuple[np.ndarray, float, int]] = []
 
     # ------------------------------------------------------------------ extra layers
     def register_layer(self, name: str, fill: float = 0.0, dtype=np.float32, scale: float = 1.0,
@@ -236,6 +239,7 @@ class LayeredMap:
         labels = self.classify_points(scan, pose)
         new = labels == NEW
         g = self.static
+        self.last_clusters = []
         if new.any():
             self._track(scan, pose, new, labels, now)
         else:
@@ -304,6 +308,8 @@ class LayeredMap:
                 self._next_id += 1
                 self._blobs.append(b)
             b.history.append((now, c.copy()))
+            if not b.promoted:
+                self.last_clusters.append((c, w, n))
         # beams of promoted blobs become ordinary room hits (slow static update)
         promoted = [b for b in self._blobs if b.promoted and b.last_s == now]
         if promoted:
