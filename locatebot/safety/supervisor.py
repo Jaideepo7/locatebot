@@ -54,6 +54,9 @@ class Reason(enum.Enum):
     REVERSE_BLOCKED = "reverse_blocked"
     LOW_COVERAGE = "low_coverage"
     OBSTACLE = "obstacle"
+    # Not produced by ``evaluate``; shared here so every stop reason lives in one enum.
+    FAULT = "fault"                        # Pi control loop caught an exception: motor stopped
+    ULTRASONIC = "ultrasonic"              # reserved for ultrasonic fusion (ROADMAP T1.2)
 
 
 @dataclass(frozen=True)

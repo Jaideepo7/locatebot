@@ -16,7 +16,7 @@ Priority (docs/PROJECT.md §3): E-stop > LiDAR safety stop > manual > mission.
   ``EStopCmd(engage=False)`` never releases it; only ``release_estop_local()`` does, and it
   clears every held command so the car does not drive on release.
 - ``tick()`` never lets an exception escape: any error stops the motor and reports
-  ``PiReason.FAULT``.
+  ``Reason.FAULT``.
 
 All public methods are thread-safe (HTTP server thread + control loop thread).
 """
@@ -33,15 +33,17 @@ from typing import Callable
 
 from locatebot.lidar.types import Scan
 from locatebot.link.messages import DriveCmd, EStopCmd, PiStatus
-from locatebot.safety.supervisor import DriveCommand, SafetyDecision, SafetySupervisor
+from locatebot.safety.supervisor import DriveCommand, Reason, SafetyDecision, SafetySupervisor
 
 from .motor import MotorDriver
 
 
 class PiReason(enum.Enum):
-    """Stop reasons produced by the controller itself (not by the supervisor)."""
+    """Stop reasons produced by the controller itself that are not in the supervisor's ``Reason``.
 
-    FAULT = "fault"    # an exception inside tick: motor stopped
+    A fault inside ``tick`` reports ``Reason.FAULT`` (supervisor enum).
+    """
+
     CLOSED = "closed"  # controller closed: motor stopped and no longer driven
 
 
@@ -207,8 +209,8 @@ class PiController:
                 self._fault_trace = traceback.format_exc()
                 self._safe_stop()
                 self._out = (0.0, 0.0)
-                self._reason = PiReason.FAULT.value
-                return SafetyDecision(0.0, 0.0, PiReason.FAULT)  # type: ignore[arg-type]
+                self._reason = Reason.FAULT.value
+                return SafetyDecision(0.0, 0.0, Reason.FAULT)
 
     def close(self) -> None:
         with self._lock:
