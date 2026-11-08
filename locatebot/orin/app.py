@@ -240,13 +240,37 @@ def _png(gray: np.ndarray) -> bytes:
             + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
-def map_png(runtime: OrinRuntime) -> bytes:
-    """Map image, north up: row 0 is the top (max y), like the PGM export."""
+def map_png(runtime: OrinRuntime, overlay: str | None = None) -> bytes:
+    """Map image, north up: row 0 is the top (max y), like the PGM export.
+
+    ``overlay="wifi"`` (M3, saved-map mode): cells with Wi-Fi readings tinted red (-90 dBm) to
+    green (-40 dBm); an RGB PNG. Without readings it is the plain grey map."""
     classes = runtime.mapper.grid_snapshot().classify()
     img = np.full(classes.shape, 160, np.uint8)
     img[classes == FREE] = 255
     img[classes == OCCUPIED] = 0
-    return _png(np.ascontiguousarray(img[::-1]))
+    wifi = runtime.mapper.layer_snapshot("wifi_rssi") if overlay == "wifi" and hasattr(
+        runtime.mapper, "layer_snapshot") else None
+    if wifi is None or wifi.shape != img.shape or not np.isfinite(wifi).any():
+        return _png(np.ascontiguousarray(img[::-1]))
+    rgb = np.repeat(img[:, :, None], 3, axis=2).astype(np.float32)
+    m = np.isfinite(wifi)
+    t = np.clip((wifi[m] + 90.0) / 50.0, 0.0, 1.0)
+    tint = np.column_stack((255 * (1 - t), 255 * t, np.full_like(t, 40)))
+    rgb[m] = 0.4 * rgb[m] + 0.6 * tint
+    return _png_rgb(np.ascontiguousarray(rgb.astype(np.uint8)[::-1]))
+
+
+def _png_rgb(rgb: np.ndarray) -> bytes:
+    """Encode an 8-bit RGB image (H, W, 3) as PNG (stdlib zlib only)."""
+    h, w, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[r].tobytes() for r in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
 def scan_json(runtime: OrinRuntime, max_points: int = 1000) -> dict:
@@ -314,7 +338,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/status":
             self._json(200, app.status())
         elif self.path.startswith("/map.png"):
-            self._send(200, map_png(app.runtime), "image/png")
+            self._send(200, map_png(app.runtime, "wifi" if "wifi=1" in self.path else None), "image/png")
         elif self.path.startswith("/scan.json"):
             self._json(200, scan_json(app.runtime))
         elif self.path == "/radar":
@@ -399,7 +423,7 @@ button.go{background:var(--ok);border:0}input,select{background:#222;color:var(-
 <header><h1>locatebot mission</h1><a href="/radar" style="color:#9cf">live radar</a><span id="conn" class="k">connecting...</span><button id="stop">STOP</button></header>
 <main>
 <section><h2>Map</h2><canvas id="map" width="400" height="400"></canvas>
-<div class="row k" id="mapinfo"></div>
+<div class="row k" id="mapinfo"></div><label class="k"><input type="checkbox" id="wifi"> Wi-Fi overlay</label>
 <div class="row"><input id="mapname" placeholder="map name" size="12"><button id="save">Save map</button></div></section>
 <section>
 <h2>Skill</h2><table id="skill"></table>
@@ -444,7 +468,7 @@ async function tick(){try{const s=await (await fetch("/status")).json();window.l
  rows($("items"),s.items.map(i=>[i.name,`${i.confirmed?"confirmed":"unconfirmed"} (${i.sightings}) at (${i.x}, ${i.y})`]));
  $("events").innerHTML=s.events.slice().reverse().map(e=>`<div>${esc(e.text)}</div>`).join("");
  $("mapinfo").textContent=`${s.map.integrated}/${s.map.scans} scans integrated`;
- img.src="/map.png?"+Date.now();draw()}catch(e){$("conn").textContent="disconnected"}}
+ img.src="/map.png?"+($("wifi").checked?"wifi=1&":"")+Date.now();draw()}catch(e){$("conn").textContent="disconnected"}}
 setInterval(tick,700);tick();
 </script></body></html>
 """.replace("SKILLS", _SKILL_BUTTONS)

@@ -118,3 +118,24 @@ def test_changes_line_bounded_and_absent_when_empty():
     line = [l for l in render_world_state(dataclasses.replace(base, changes=many)).splitlines()
             if l.startswith("changes:")][0]
     assert line.startswith("changes: 9 new things: ") and line.endswith("(+6 more)") and len(line) < 200
+
+
+def test_people_line_none_one_many_and_notes():
+    import dataclasses
+
+    from locatebot.mission.types import PersonView
+    base = ws()
+    lines = render_world_state(base).splitlines()
+    assert "people: none" in lines and lines[-1].startswith("last event:")
+    one = (PersonView(1.0, 2.0, 1.2, 0.0, 0.6, True, True, 0.0),)
+    line = [l for l in render_world_state(dataclasses.replace(base, people=one)).splitlines()
+            if l.startswith("people:")][0]
+    assert line == "people: 1 person 1.2 m ahead walking (0.6 m/s, camera-confirmed)"
+    many = tuple(PersonView(0, 0, 1.0 + k, math.radians(40), 0.0, False, False, 1.0) for k in range(5))
+    line = [l for l in render_world_state(dataclasses.replace(base, people=many)).splitlines()
+            if l.startswith("people:")][0]
+    assert line.startswith("people: 5 people: 1.0 m 40° left standing (lidar only), ")
+    assert line.endswith("(+2 more)") and len(line) < 250
+    notes = ("glass or low obstacle: 0.6 m ahead (ultrasonic only)", "wifi: weak here (-80 dBm)")
+    text = render_world_state(dataclasses.replace(base, notes=notes)).splitlines()
+    assert notes[0] in text and notes[1] in text and text[-1].startswith("last event:")

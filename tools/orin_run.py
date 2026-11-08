@@ -104,9 +104,9 @@ def lidar_source(app: OrinApp, stop: threading.Event, port: str, baud: int, moun
 
 def pi_source(app: OrinApp, stop: threading.Event, host: str, clock: PeerClock) -> None:
     from locatebot.lidar.types import Scan
-    from locatebot.link.messages import Frame, PiStatus
+    from locatebot.link.messages import Frame, PiStatus, Range
     from locatebot.link.transport import Subscriber, pi_pub_endpoint
-    with Subscriber(pi_pub_endpoint(host), ["scan", "frame", "pi_status"], newest_only=("frame",)) as sub:
+    with Subscriber(pi_pub_endpoint(host), ["scan", "frame", "pi_status", "range"], newest_only=("frame",)) as sub:
         while not stop.is_set():
             for msg in sub.poll(0.2):
                 if isinstance(msg, Scan):
@@ -116,6 +116,8 @@ def pi_source(app: OrinApp, stop: threading.Event, host: str, clock: PeerClock) 
                     app.on_frame(msg.jpeg, msg.capture_s)
                 elif isinstance(msg, PiStatus):
                     app.runtime.set_safety_reason(msg.safety_reason)
+                elif isinstance(msg, Range):  # M3: ultrasonic -> glass_or_low layer (saved-map mode)
+                    app.runtime.on_range(msg)
 
 
 # Random per process start; OrinStatus carries it so the Pi resets its drive seq filter after a restart.
@@ -199,6 +201,18 @@ def make_mapper(ap, args) -> LiveMapper:
     return lm
 
 
+def wifi_source(mapper: LiveMapper, stop: threading.Event, clock, iface: str | None = None) -> None:
+    """M3: 1 Hz Wi-Fi RSSI into the wifi_rssi layer (saved-map mode). No Wi-Fi tool: disabled."""
+    from locatebot.orin.wifi import WifiReader
+    reader = WifiReader(iface)
+    if not reader.enabled:
+        log.info("wifi layer disabled: no /proc/net/wireless interface and no iw")
+        return
+    log.info("wifi layer: %s via %s", reader.iface, reader.mode)
+    while not stop.wait(1.0):
+        mapper.add_wifi(reader.read(), clock())
+
+
 def map_stem(path: Path) -> Path:
     name = path.name[:-len(".lbmap")] if path.name.endswith(".lbmap") else path.name
     return path.with_name(name)
@@ -238,6 +252,7 @@ def main(argv=None) -> int:
     ap.add_argument("--map", type=Path, help="saved .lbmap to localize in (instead of a new map)")
     ap.add_argument("--start-pose", help="with --map: where the car is in that map, x,y,deg")
     ap.add_argument("--save-map", action="store_true", help="with --map: overwrite it on exit")
+    ap.add_argument("--wifi-iface", help="with --map: Wi-Fi interface for the coverage layer (default: auto)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--maps-dir", default=str(ROOT / "maps"))
@@ -288,6 +303,9 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     source.start()
+    if args.map is not None and not args.sim:
+        threading.Thread(target=wifi_source, args=(runtime.mapper, stop, clock, args.wifi_iface),
+                         name="wifi", daemon=True).start()
     app.start()
     web.start()
     host, port = server.server_address[:2]

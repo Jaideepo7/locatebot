@@ -41,6 +41,8 @@ log = logging.getLogger(__name__)
 class RuntimeConfig:
     localize: LocalizeConfig = LocalizeConfig()
     min_sightings: int = 2           # sightings before an item track counts as confirmed
+    person_check_s: float = 5.0      # M3: how long vision looks for "person" per tracker request
+    person_window_rad: float = math.radians(5.0)  # M3: LiDAR range search half-width for people
     merge_radius_m: float = 0.5
     event_keep: int = 20
 
@@ -65,6 +67,7 @@ class OrinRuntime:
         self._last_state = self.executor.status.state
         self._confirmed: set[str] = set()
         self._stats = {"scans": 0, "frames": 0, "vision_results": 0, "fixes": 0, "no_range": 0, "steps": 0}
+        self._person_check_until = -math.inf  # M3: low-priority vision "person" check window
 
     # ------------------------------------------------------------------ inputs (any thread)
     def on_scan(self, scan: Scan) -> None:
@@ -78,6 +81,10 @@ class OrinRuntime:
         if self.vision is not None:
             self.vision.submit_frame(jpeg, capture_s)
 
+    def on_range(self, msg) -> None:
+        """Ultrasonic ``link.messages.Range`` from the Pi (M3): glass / low obstacle layer."""
+        self.mapper.on_range(msg.stamp_s, msg.range_m, msg.fov_rad)
+
     def on_vision_result(self, result: VisionResult) -> None:
         """VisionService callback: place each detection on the map with the LiDAR range."""
         pose = self.mapper.pose_at(result.capture_s)
@@ -86,11 +93,20 @@ class OrinRuntime:
             self._stats["vision_results"] += 1
             if pose is None or scan is None:
                 return
+            is_person = result.item.strip().lower() in ("person", "people")
+            # a box centre often falls between a person's legs: look a little wider for the range
+            lcfg = (replace(self.config.localize, window_rad=max(self.config.localize.window_rad,
+                                                                 self.config.person_window_rad))
+                    if is_person else self.config.localize)
             for f in result.found:
-                fix = localize(f.bearing_rad, scan, pose, self.config.localize, stamp_s=result.capture_s)
+                fix = localize(f.bearing_rad, scan, pose, lcfg, stamp_s=result.capture_s)
                 if fix is None:
                     self._stats["no_range"] += 1  # no LiDAR return along the bearing: no position
                     continue
+                if is_person:  # M3: confirms a LiDAR person track
+                    self.mapper.people_camera_fix((fix.x, fix.y), result.capture_s)
+                    if result.item not in self.executor.search_items:
+                        continue  # our own low-priority check: not an item the user asked for
                 track = self.tracker.update(result.item, fix)
                 self._stats["fixes"] += 1
                 if track.confirmed and result.item not in self._confirmed:
@@ -129,7 +145,8 @@ class OrinRuntime:
                     self._event(now, f"{prev.call.name.value} interrupted by {call.name.value}")
                 self.executor.start(call, now)
             inp = TickInput(now=now, pose=self.mapper.pose, grid=self.mapper.grid_snapshot(),
-                            scan=self.mapper.latest_scan, tracker=self.tracker, home=self.mapper.home)
+                            scan=self.mapper.latest_scan, tracker=self.tracker, home=self.mapper.home,
+                            people=tuple(self.mapper.people()))
             out = self.executor.tick(inp)
             st = self.executor.status
             if st.state != self._last_state and st.state in (SkillState.SUCCEEDED, SkillState.FAILED,
@@ -137,6 +154,8 @@ class OrinRuntime:
                 self._event(now, f"{st.call.name.value} {st.state.value}: {st.detail}")
             self._last_state = st.state
             items = self.executor.search_items
+            if not items and self.vision is not None:
+                items = self._person_check(now)
             ws = self._world_state(now, inp)
         if self.vision is not None and items != self._vision_items:
             self._vision_items = items
@@ -144,6 +163,18 @@ class OrinRuntime:
         if self.brain is not None:
             self.brain.on_world_state(ws)
         return out
+
+    def _person_check(self, now: float) -> tuple[str, ...]:
+        """M3: vision looks for "person" for ``person_check_s`` when the people tracker has a
+        likely person without a recent camera confirmation, and only when no search runs."""
+        if now < self._person_check_until:
+            return ("person",)
+        t = self.mapper.people_wants_camera(now)
+        if t is None:
+            return ()
+        self.mapper.people_camera_requested(t.id, now)
+        self._person_check_until = now + self.config.person_check_s
+        return ("person",)
 
     def world_state(self, now: float | None = None) -> WorldState:
         now = self.clock() if now is None else now
@@ -159,7 +190,8 @@ class OrinRuntime:
             now=now, pose=inp.pose, scan=inp.scan, tracker=self.tracker, skill=self.executor.status,
             search_items=search, explored_frac=self.executor.explored_frac,
             safety_reason=self._safety_reason, mission_state=self.executor.status.state.value,
-            last_event=self._last_event, changes=self.mapper.change_blobs())
+            last_event=self._last_event, changes=self.mapper.change_blobs(),
+            people=self.mapper.people(), notes=self.mapper.notes(now))
 
     def _event(self, t: float, text: str) -> None:
         self._events.append((t, text))
