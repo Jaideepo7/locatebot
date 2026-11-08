@@ -1,6 +1,6 @@
 # Remote control over Photon/Telegram (`locatebot/remote/`, runs on the Pi)
 
-**Status:** R1 (messaging core) and R2 (Photon WebSocket inbound + `tools/remote_run.py`) built and tested in software only: SQLite in a temp dir, a scripted `FakeRobotLink` instead of the Orin, a recording provider instead of Photon, a fake Photon Socket.IO server and stdlib HTTP on 127.0.0.1. **Nothing here has talked to a real Photon project, Telegram, the Pi or the Orin.** No FastAPI, uvicorn or httpx; `websockets` (the `remote` extra) is needed only for WebSocket inbound and imported lazily.
+**Status:** R1 (messaging core), R2 (Photon WebSocket inbound + `tools/remote_run.py`) and R3 (mission bridge Pi ⇄ Orin over ZeroMQ) built and tested in software only: SQLite in a temp dir, a scripted `FakeRobotLink` instead of the Orin, a recording provider instead of Photon, a fake Photon Socket.IO server and stdlib HTTP on 127.0.0.1. **Nothing here has talked to a real Photon project, Telegram, the Pi or the Orin.** No FastAPI, uvicorn or httpx; `websockets` (the `remote` extra) is needed only for WebSocket inbound and imported lazily.
 
 **Credit:** the messaging half is chanabyte's work on `feat/photon-dispatch` (commits `97dd665`, `5941277`, `137536a`), moved here and adapted per the review in `docs/ROADMAP.md` section R.
 
@@ -26,6 +26,7 @@ Nothing here can move the car. The only frames sent to the robot are `MISSION_RE
 | `missions.py` | `backend/missions.py` | `MissionService`: missions, ownership, dedupe, rate limit, timeouts, state changes |
 | `config.py` | `backend/config.py` | `Settings.from_env`; secrets never in errors or `repr` |
 | `robot.py` | new (from `dispatch/sink.py` + `dispatch/agent.py` rules) | `RobotLink` protocol + `FakeRobotLink` (scripted robot for tests/demos) |
+| `robot_zmq.py` | new (R3) | `ZmqRobotLink`: missions to the Orin over the ZeroMQ link, statuses back |
 | `service.py` | replaces `backend/app.py` | `RemoteService`: store + provider + `MissionService` + `OutboxSender` + inbound (WebSocket or webhook) + link + one background thread |
 | `server.py` | replaces `backend/app.py` | stdlib `ThreadingHTTPServer`: the routes below |
 
@@ -39,6 +40,45 @@ Dropped: the FastAPI app, `backend/robot_link.py` (WebSocket device authenticati
 - optional `start()` / `stop()`: `RemoteService` calls them.
 
 `FakeRobotLink(script="happy"|"not_found"|"stall"|"reject"|[Step...], clock=time.time, online=True, cancel_delay_s=0.5, silent=False)` plays the script on `poll()` (or its own thread after `start()`): ACK on request; rejects expired, future-dated (> 30 s), duplicate (same answer again) and concurrent missions; confirms a cancel after `cancel_delay_s`; `drop()` stops the mission at once (`CANCELLED`, `LINK_LOST`) and `connect()` re-reports that real state.
+
+## Mission flow over the link (R3)
+```text
+Telegram /find marker
+  │ Photon (WebSocket or webhook)
+  ▼
+Pi: MissionService ──MISSION_REQUEST dict──► ZmqRobotLink ──MissionRequest(id, target, issued_s, expires_s)──► PUB :5555
+                                                                                                                │
+Orin: pi_source SUB ──► MissionBridge.on_request ──(control loop) tick──► set_goal("find marker")              ◄┘
+                          │                                               routine: submit_operator(search([marker])) → go_to(item=marker)
+                          │                                               LLM: the brain acts on the goal (approve/auto)
+                          └── watches executor + item tracker ──► MissionStatus(id, state, message, reason) ──► PUB :5556
+Pi: ZmqRobotLink SUB ──► MISSION_ACK / MISSION_STATUS frame ──► MissionService.on_robot_frame ──► outbox ──► Telegram reply
+```
+`ZmqRobotLink.connected` = an `orin_status` heard within 3 s (the Orin sends one per second). The first status of a mission becomes `MISSION_ACK` (`ACCEPTED`, or `REJECTED` if it is `FAILED` with `BUSY`/`EXPIRED`/`CLOCK_SKEW`/`INVALID_EXPIRY`); later ones are `MISSION_STATUS`. Mission times on the link are Unix wall clock (`issued_s`, `expires_s`): run NTP/chrony on both boards.
+
+| Orin observes | Status sent | Customer reads |
+|---|---|---|
+| mission started (goal set, routine search issued) | `ACCEPTED` | (nothing; already told "Request received") |
+| `search` / `explore` / `look_around` running | `SEARCHING` | "The robot has started searching for: marker." |
+| a track named like the target becomes **confirmed** | `TARGET_DETECTED` (message: map position) | "Target detected. Preparing to approach it." |
+| `go_to(item=target)` running | `APPROACHING` | "The robot is approaching the target." |
+| that `go_to` succeeded | `COMPLETED` | "Search mission completed." |
+| a search for the target ended without it | `FAILED` `NOT_FOUND` (message: the executor's found/missing text) | "I couldn't spot marker. The search has ended. (… not found: marker; found: …)" |
+| `go_to` found no path | `FAILED` `NO_PATH` | "The search for marker ended without success." |
+| mission TTL reached on the Orin | `FAILED` `TIMEOUT` (the robot is stopped) | same |
+| executor internal error | `FAILED` `ROBOT_FAULT` (the robot is stopped) | same |
+| someone else stopped the robot (operator page STOP, LLM `stop`, fallback) | `FAILED` `STOPPED` | same |
+| `/cancel` → operator STOP → executor stopped | `CANCELLED` | "Cancelling…", then "Mission cancelled." |
+| `go_to` lost the target, then a search runs again | `SEARCHING` (from `APPROACHING`/`TARGET_DETECTED`) | "Lost sight of the target. Searching again for: marker." |
+| request expired / > 5 s in the future / `expires <= issued` / another mission active | `FAILED` `EXPIRED` / `CLOCK_SKEW` / `INVALID_EXPIRY` / `BUSY` → `MISSION_ACK REJECTED` | "The robot couldn't start this search (…)." |
+
+Each state is sent once, in the allowed transition order (`protocol.TRANSITIONS`; the Orin has an identical copy, tested equal). A missing intermediate state is filled in only when it is true (e.g. `go_to` to a target that is already on the map from an earlier search gives `SEARCHING`, `TARGET_DETECTED`, `APPROACHING`). A duplicate request id gets the last status again and is never started twice.
+
+**Cancel:** `/cancel` → `MISSION_CANCEL` → Orin operator `STOP` (with an LLM brain this also pauses it) and the goal is cleared → `CANCELLED` once the executor shows that STOP finished (or after 3 s with nothing running). **Link loss:** the Orin stops the robot when it hears no Pi scan for 2 s and keeps the mission; when scans return it re-reports the current state and resumes (routine: re-issues the current step; LLM: resumes the brain). The Pi's own safety stop already halts the car when Orin commands stop. On the Pi, `MissionService` tells the customer "Lost contact with the robot" when `orin_status` stops for 3 s and fails the mission with `LINK_LOST` after 15 s unless the Orin comes back.
+
+**Wording matters:** the target text is the item name vision searches for, matched case-insensitively and exactly against item tracks. Short common nouns work best ("marker", not "dry erase marker pen"; see `docs/vision/README.md`).
+
+Run: `tools/remote_run.py --robot zmq --orin-host <orin-address>` (or `$LOCATEBOT_ORIN_HOST`; `--pi-bind` picks the interface for the Pi PUB on 5555) on the Pi, and `tools/orin_run.py --pi-host <pi-address> ...` on the Orin (subscribes `mission_request`/`mission_cancel`, publishes `mission_status`). Standalone, `ZmqRobotLink` binds 5555 itself: in the full car the Pi process that already owns 5555 (T1.3) must pass its `Publisher` and call `link.flush_outgoing(pub)` from its own thread.
 
 ## Configuration (environment, or `.env` which is git-ignored; see `.env.example`)
 | Variable | Required | Meaning |
@@ -113,7 +153,7 @@ export PHOTON_INBOUND=webhook PHOTON_MODE=console PHOTON_PROJECT_ID=pho_prj_01ja
 .venv/bin/python tools/send_fake_webhook.py --text "/find blue toolbox"
 curl -s http://127.0.0.1:8070/healthz
 ```
-Flags: `--env-file` (default repo `.env`; never overrides variables already set), `--host`/`--port` (default 127.0.0.1:8070), `--robot fake` (R3 adds `zmq`), `--fake-script happy|not_found|stall|reject`, `--console`, `--debug`. Ctrl+C / SIGTERM shut down cleanly (inbound closed, HTTP server stopped, threads joined).
+Flags: `--env-file` (default repo `.env`; never overrides variables already set), `--host`/`--port` (default 127.0.0.1:8070), `--robot fake|zmq` (`--orin-host`, `--pi-bind`), `--fake-script happy|not_found|stall|reject`, `--console`, `--debug`. Ctrl+C / SIGTERM shut down cleanly (inbound closed, HTTP server stopped, threads joined).
 
 systemd: `deploy/locatebot-remote.service` (`Restart=always`, `MemoryMax=150M`, reads `.env` via `--env-file`; adjust `User`/paths).
 
@@ -123,8 +163,7 @@ systemd: `deploy/locatebot-remote.service` (`Restart=always`, `MemoryMax=150M`, 
 - Target on the Pi: < 80 MB (`MemoryMax=150M` in the unit). Not measured on the Pi yet.
 
 ## Tests
-`tests/remote/` (all run without FastAPI/uvicorn/httpx/websockets, no network): the branch's unit tests for protocol, commands, config, photon, notifier, missions; `test_robot.py` (FakeRobotLink); `test_server.py` (real server on 127.0.0.1 port 0, urllib); `test_e2e.py` (scenarios E1–E12 from the branch, driven through `FakeRobotLink`); `test_photon_ws.py` (fake Photon Socket.IO server on 127.0.0.1: happy path, duplicate id / replayed cursor, malformed frames, drop + backoff + resume, backoff cap and jitter, HTTP 401 and `connect_error` without a tight loop, rejected/timed-out subscribe, heartbeat, fatal `delivery_error` with `retryAfterMs`, handler failure resumes from the saved cursor, `stop()` < 1 s, key never in logs/`repr`/status, `RemoteService` end to end); `test_tools.py` (`tools/send_fake_webhook.py`, `tools/remote_run.py` as a real process: webhook in, reply out, SIGTERM exit 0).
+`tests/remote/` (all run without FastAPI/uvicorn/httpx/websockets, no network): the branch's unit tests for protocol, commands, config, photon, notifier, missions; `test_robot.py` (FakeRobotLink); `test_server.py` (real server on 127.0.0.1 port 0, urllib); `test_e2e.py` (scenarios E1–E12 from the branch, driven through `FakeRobotLink`); `test_photon_ws.py` (fake Photon Socket.IO server on 127.0.0.1: happy path, duplicate id / replayed cursor, malformed frames, drop + backoff + resume, backoff cap and jitter, HTTP 401 and `connect_error` without a tight loop, rejected/timed-out subscribe, heartbeat, fatal `delivery_error` with `retryAfterMs`, handler failure resumes from the saved cursor, `stop()` < 1 s, key never in logs/`repr`/status, `RemoteService` end to end); `test_tools.py` (`tools/send_fake_webhook.py`, `tools/remote_run.py` as a real process: webhook in, reply out, SIGTERM exit 0). R3: `test_robot_zmq.py` (127.0.0.1 ZeroMQ with a fake Orin: request/cancel encoding, status → ACK/STATUS frames, connected/disconnected from `orin_status` timing, malformed messages dropped, shared publisher); `tests/orin/test_missions.py` (bridge unit tests with a fake runtime); `tests/orin/test_mission_e2e.py` (`RemoteService` + `ZmqRobotLink` ⇄ ZeroMQ ⇄ `MissionBridge` + `OrinRuntime` on the simulated car, no LLM: `/find marker` → accepted, searching, detected, approaching, completed in ≈ 45 s sim / 7 s wall, car ends < 1.4 m from the marker; `/find unicorn` → `NOT_FOUND` with the found/missing text (40 s search timeout, ≈ 7 s wall); `/cancel` mid-search → cancelled and the executor stopped, < 1 s wall).
 
 ## What comes next
-- **R3:** `ZmqRobotLink` (Pi) + `MissionBridge` (Orin) over the existing ZeroMQ link.
-- **R5 (live):** real Photon project + Telegram bot. Confirm: the WebSocket handshake and our Socket.IO subset against the real server (path, `Authorization` header, `40` → subscribe ack, ping/pong timing); the subscribe ack fields and `limits`; that `delivery` events are `message.received` / `telegram.photon` with the shape `parse_event` expects; cursor resume after a Pi restart and after pulling the uplink; `delivery_error` codes seen in practice; that `senderId` = bot user from `receivedBy` and `format: "plain"` are accepted for replies; that the key's scopes cover both receiving (`project:read`) and sending. Capture one real event (PII removed) to replace the synthetic `tests/fixtures/photon_message_received.json`. Measure RSS on the Pi.
+- **R5 (live):** real Photon project + Telegram bot. Confirm: the WebSocket handshake and our Socket.IO subset against the real server (path, `Authorization` header, `40` → subscribe ack, ping/pong timing); the subscribe ack fields and `limits`; that `delivery` events are `message.received` / `telegram.photon` with the shape `parse_event` expects; cursor resume after a Pi restart and after pulling the uplink; `delivery_error` codes seen in practice; that `senderId` = bot user from `receivedBy` and `format: "plain"` are accepted for replies; that the key's scopes cover both receiving (`project:read`) and sending. Capture one real event (PII removed) to replace the synthetic `tests/fixtures/photon_message_received.json`. Measure RSS on the Pi. Mission bridge on the real cable: Pi ⇄ Orin clocks in sync (NTP/chrony; `CLOCK_SKEW` otherwise), `mission_status` delivery and order, link-loss stop/resume by pulling the cable, a real `/find` with the camera and LocateAnything (item wording), and ZmqRobotLink inside the Pi process that owns port 5555.

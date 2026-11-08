@@ -279,6 +279,15 @@ def test_not_found_never_claims_detection(rig):  # E2
     assert not any("detected" in r.lower() for r in replies(store))
 
 
+def test_not_found_appends_the_robots_summary(rig):
+    svc, store, link, _ = rig
+    mid = start_find(svc, link)
+    robot(svc, mid, status="SEARCHING")
+    robot(svc, mid, status="FAILED", reason="NOT_FOUND", message="not found: blue toolbox; found: nothing")
+    assert replies(store)[-1] == ("I couldn't spot blue toolbox. The search has ended. "
+                                  "(not found: blue toolbox; found: nothing)")
+
+
 @pytest.mark.parametrize("frame", ["garbage", json.dumps({"type": "MISSION_STATUS", "mission_id": str(uuid.uuid4()),
                                                           "status": "COMPLETED"}),
                                    json.dumps({"type": "MISSION_REQUEST"}),

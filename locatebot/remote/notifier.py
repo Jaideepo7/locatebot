@@ -54,8 +54,10 @@ def rejected_text(reason: Optional[str]) -> str:
     return f"The robot couldn't start this search ({_REJECT_REASONS.get(reason or '', 'it declined the request')})."
 
 
-def status_text(old: S, new: S, target: str, reason: Optional[str] = None) -> Optional[str]:
-    """Message for a state change, or None when the customer should not be messaged."""
+def status_text(old: S, new: S, target: str, reason: Optional[str] = None,
+                message: Optional[str] = None) -> Optional[str]:
+    """Message for a state change, or None when the customer should not be messaged.
+    For NOT_FOUND the robot's own summary (what it found / missed) is appended when given."""
     if old == new:
         return None
     if new == S.SEARCHING:
@@ -74,7 +76,7 @@ def status_text(old: S, new: S, target: str, reason: Optional[str] = None) -> Op
         return "Mission cancelled."
     if new == S.FAILED:
         return {
-            "NOT_FOUND": f"I couldn't spot {target}. The search has ended.",
+            "NOT_FOUND": f"I couldn't spot {target}. The search has ended." + (f" ({message})" if message else ""),
             "EXPIRED": f"The search for {target} timed out.",
             "LINK_LOST": "Mission ended: the robot is offline.",
             "NO_ACK": "The robot didn't respond. Please try again.",

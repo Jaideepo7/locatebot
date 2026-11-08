@@ -112,3 +112,14 @@ def test_remote_run_process_serves_webhook_and_stops_on_sigterm(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def test_remote_run_zmq_needs_an_orin_host(capsys, monkeypatch):
+    tool = load("remote_run")
+    monkeypatch.delenv("LOCATEBOT_ORIN_HOST", raising=False)
+    monkeypatch.setenv("PHOTON_INBOUND", "webhook")
+    monkeypatch.setenv("PHOTON_MODE", "console")
+    monkeypatch.setenv("PHOTON_WEBHOOK_SECRET", SECRET)
+    monkeypatch.setenv("PHOTON_PROJECT_ID", PROJECT)
+    assert tool.main(["--env-file", "/nonexistent/.env", "--robot", "zmq", "--port", "0"]) == 2
+    assert "LOCATEBOT_ORIN_HOST" in capsys.readouterr().err

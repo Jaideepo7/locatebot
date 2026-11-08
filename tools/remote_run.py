@@ -6,13 +6,15 @@ Loads `.env` (git-ignored; see `.env.example`) without overriding variables alre
     (`PHOTON_INBOUND=webhook`, needs a public HTTPS tunnel to --host/--port);
   - the local HTTP server (`/healthz`, `/api/photon/webhook`, `/api/missions*`) on --host:--port;
   - the reply outbox sender and the mission timeouts (background thread);
-  - the robot link: `--robot fake` (scripted stand-in for the Orin; R3 adds `--robot zmq`).
+  - the robot link: `--robot fake` (scripted stand-in for the Orin) or `--robot zmq --orin-host <addr>`
+    (missions over the ZeroMQ link: Pi PUB on --pi-bind:5555, Orin PUB <addr>:5556).
 The robot keeps working without internet: inbound reconnects quietly and replies stay queued.
 
 Examples:
   .venv/bin/python tools/remote_run.py                                  # .env, WebSocket inbound
   .venv/bin/python tools/remote_run.py --console                        # print replies, don't send
   PHOTON_INBOUND=webhook .venv/bin/python tools/remote_run.py --console --robot fake --fake-script happy
+  .venv/bin/python tools/remote_run.py --robot zmq --orin-host <orin-address>     # the car
 Ctrl+C or SIGTERM stops cleanly. --debug logs RSS every 60 s.
 """
 from __future__ import annotations
@@ -79,8 +81,15 @@ def build(args, env: Mapping[str, str]):
     settings = Settings.from_env(env)
     if args.robot == "fake":
         link = FakeRobotLink(args.fake_script)
-    else:  # pragma: no cover - argparse restricts choices
-        raise SystemExit(f"unknown robot link {args.robot}")
+    else:
+        from locatebot.link.messages import PI_PUB_PORT
+        from locatebot.link.transport import bind_endpoint, orin_pub_endpoint
+        from locatebot.remote.robot_zmq import ZmqRobotLink
+        try:
+            orin = orin_pub_endpoint(args.orin_host)  # or $LOCATEBOT_ORIN_HOST
+        except ValueError as e:
+            raise ConfigError(f"--robot zmq: {e}") from None
+        link = ZmqRobotLink(orin, pub_endpoint=bind_endpoint(PI_PUB_PORT, args.pi_bind))
     service = RemoteService(settings, link=link)  # PHOTON_MODE=console (or --console) prints replies
     server = make_server(service, args.host, args.port)
     return service, server
@@ -110,7 +119,9 @@ def main(argv=None) -> int:
     ap.add_argument("--env-file", default=str(ROOT / ".env"), help="KEY=VALUE file (default: repo .env)")
     ap.add_argument("--host", default="127.0.0.1", help="operator/webhook HTTP bind host (default 127.0.0.1)")
     ap.add_argument("--port", type=int, default=8070)
-    ap.add_argument("--robot", choices=["fake"], default="fake", help="robot link (R3 adds zmq)")
+    ap.add_argument("--robot", choices=["fake", "zmq"], default="fake", help="robot link")
+    ap.add_argument("--orin-host", help="--robot zmq: Orin address (or $LOCATEBOT_ORIN_HOST)")
+    ap.add_argument("--pi-bind", default="*", help="--robot zmq: interface for the Pi PUB socket (port 5555)")
     ap.add_argument("--fake-script", choices=sorted(SCRIPTS), default="happy")
     ap.add_argument("--console", action="store_true", help="print replies instead of sending them")
     ap.add_argument("--debug", action="store_true")

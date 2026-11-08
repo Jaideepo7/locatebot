@@ -260,7 +260,7 @@ class MissionService:
         if new == S.FAILED or (new == S.CANCELLED and reason):
             changes["fail_reason"] = reason or "ROBOT_REPORTED"
         self._store.update_mission(m.mission_id, **changes)
-        reply = text.status_text(old, new, m.target, reason)
+        reply = text.status_text(old, new, m.target, reason, message)
         if reply:
             self._reply(m, f"{m.mission_id}:{new.value}", reply, now)
 

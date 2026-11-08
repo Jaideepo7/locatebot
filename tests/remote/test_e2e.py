@@ -140,7 +140,8 @@ def test_e2_not_found():
     w.run(10)
     assert w.chat() == ["Request received. Sending your target to the robot.",
                         "The robot has started searching for: blue toolbox.",
-                        "I couldn't spot blue toolbox. The search has ended."]
+                        "I couldn't spot blue toolbox. The search has ended. "
+                        "(Searched the area; blue toolbox not seen)"]
 
 
 def test_e3_robot_offline():
