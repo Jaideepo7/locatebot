@@ -188,3 +188,23 @@ def test_tracker_items_are_independent():
     t.update("a", ItemFix(1.0, 1.0, 1.0, 0.1, 0.0))
     assert t.tracks("b") == [] and t.best("b") is None
     assert t.items() == ["a"]
+
+
+# --- review fixes ------------------------------------------------------------
+
+def test_pose_history_rejects_non_finite():
+    h = PoseHistory()
+    with pytest.raises(ValueError):
+        h.add(math.nan, Pose2D(0, 0, 0))
+    with pytest.raises(ValueError):
+        h.add(1.0, Pose2D(math.nan, 0, 0))
+    h.add(1.0, Pose2D(0, 0, 0))
+    assert h.at(math.nan) is None
+
+
+def test_tracker_handles_zero_sigma():
+    from locatebot.localize.items import ItemFix
+    t = ItemTracker()
+    t.update("a", ItemFix(1.0, 1.0, 1.0, 0.0, 0.0))
+    t.update("a", ItemFix(1.1, 1.0, 1.0, 0.0, 1.0))
+    assert t.best("a").sightings == 2

@@ -8,6 +8,8 @@
 - `ScanHistory.nearest(t)`: scan closest to the capture time, within `max_dt_s`.
 - `ItemTracker`: merges sightings of the same item within `merge_radius_m` (inverse-variance weighted); separate tracks for far-apart sightings (second instance or false detection); `confirmed` after `min_sightings`; `best(item)` = most sightings.
 
+Timing: the bearing is in the robot frame at the frame's capture time, but the ray is searched in the scan's frame. `ScanHistory` defaults to `max_dt_s = 0.06` (about half a 10 Hz scan period) to keep the turning error small; pass the pose at the frame capture time. Motion within one LiDAR revolution is not corrected.
+
 Uncertainty per fix: `hypot(range_sigma_m, range * bearing_sigma_rad)`, so far items are less certain.
 
 ## Wiring (planned)

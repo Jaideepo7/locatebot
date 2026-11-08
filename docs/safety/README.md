@@ -8,7 +8,8 @@ Call it every control tick on the Pi with the newest scan and drive command (bot
 ## Policy
 - First failing check wins, in order: e-stop (latched) → clock → scan missing/stale/future → command missing/stale/future → invalid command → reverse → forward coverage → obstacle.
 - Every stop is throttle 0, steering 0, with a distinct `Reason`.
-- Unknown is never free: below `min_coverage` (angular bins with a valid return over `coverage_fov_rad`) the car stops.
+- Unknown is never free: below `min_coverage` (angular bins with a valid return over `coverage_fov_rad`) the car stops. When moving, every 2° bin of the corridor ahead (its angular half-width at `stop_distance_m`, for each checked steering direction) must also have a return (`corridor_min_coverage`), so a small blind wedge (black, glass or absorbing object) can't hide behind high global coverage. `max_steer_rad` is validated so the steered corridor stays inside `coverage_fov_rad`.
+- Non-numeric command values are `INVALID_COMMAND`, never an exception. The Pi control loop must still treat any exception around `evaluate` as a stop.
 - The forward corridor is checked straight ahead and rotated towards the steering direction, so turning can't dodge an obstacle.
 - Clearance ≤ `stop_distance_m` stops; up to `slow_distance_m` the throttle cap rises linearly to `max_speed`. Requested speed is never raised.
 - Reverse is always blocked (no rear policy yet). Zero throttle on a healthy scan is allowed (steer in place).

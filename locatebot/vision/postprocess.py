@@ -35,7 +35,15 @@ class Camera:
 
     @classmethod
     def from_hfov(cls, width_px: int, hfov_rad: float) -> "Camera":
+        if not width_px > 0:
+            raise ValueError(f"image width must be > 0, got {width_px}")
+        check_hfov(hfov_rad)
         return cls(cx=width_px / 2.0, fx=(width_px / 2.0) / math.tan(hfov_rad / 2.0))
+
+
+def check_hfov(hfov_rad: float) -> None:
+    if not (math.isfinite(hfov_rad) and 0.0 < hfov_rad < math.pi):
+        raise ValueError(f"horizontal field of view must be in (0, pi) radians, got {hfov_rad}")
 
 
 def build_prompt(item: str) -> str:
@@ -55,7 +63,10 @@ def parse_detections(raw: str) -> list[Detection]:
         box = d["box"]
         if len(box) != 4:
             raise ValueError(f"box must have 4 numbers, got {box!r}")
-        out.append(Detection(str(d["label"]), tuple(float(v) for v in box)))
+        vals = tuple(float(v) for v in box)
+        if not all(math.isfinite(v) for v in vals):
+            raise ValueError(f"box has non-finite values: {box!r}")
+        out.append(Detection(str(d["label"]), vals))
     return out
 
 
@@ -116,7 +127,11 @@ def jpeg_size(data: bytes) -> tuple[int, int]:
             continue
         (seg_len,) = struct.unpack(">H", data[i + 2:i + 4])
         if marker in _SOF_MARKERS:
+            if i + 9 > len(data):
+                raise ValueError("truncated JPEG SOF segment")
             height, width = struct.unpack(">HH", data[i + 5:i + 9])
+            if width == 0 or height == 0:
+                raise ValueError(f"JPEG has zero size {width}x{height}")
             return width, height
         i += 2 + seg_len
     raise ValueError("no SOF segment in JPEG")

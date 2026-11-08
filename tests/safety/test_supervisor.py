@@ -220,3 +220,41 @@ def test_invalid_config_rejected(kw):
 def test_decision_is_deterministic(sup):
     s, c = scan(box_ahead(0.7)), cmd(0.5, 0.3)
     assert sup.evaluate(c, s, NOW) == sup.evaluate(c, s, NOW)
+
+
+# --- review fixes: blind wedge in the corridor, non-numeric input, steering vs FOV ----------
+
+def _with_blind_wedge(s: Scan, centre_rad: float, half_rad: float) -> Scan:
+    r = np.array(s.ranges_m)
+    dev = np.abs((s.angles_rad - centre_rad + math.pi) % (2 * math.pi) - math.pi)
+    r[dev <= half_rad] = np.nan
+    return Scan(s.stamp_s, s.seq, s.angles_rad, r, s.quality)
+
+
+def test_small_blind_wedge_in_corridor_stops_even_with_high_global_coverage(sup):
+    # wall 3 m ahead, 9 beams (+-4.5 deg) return nothing: e.g. a black or glass object
+    s = _with_blind_wedge(scan(), 0.0, math.radians(4.5))
+    d = sup.evaluate(cmd(0.5), s, NOW)
+    assert d.reason is Reason.LOW_COVERAGE and d.throttle == 0.0
+
+
+def test_blind_wedge_in_steering_direction_stops(sup):
+    s = _with_blind_wedge(scan(), math.radians(30), math.radians(3))
+    assert sup.evaluate(cmd(0.3, 0.0), s, NOW).reason is Reason.OK  # not in the straight corridor
+    assert sup.evaluate(cmd(0.3, 1.0), s, NOW).reason is Reason.LOW_COVERAGE
+
+
+def test_blind_wedge_with_zero_throttle_still_allows_steering(sup):
+    s = _with_blind_wedge(scan(), 0.0, math.radians(4.5))
+    assert sup.evaluate(cmd(0.0, 0.5), s, NOW).reason is Reason.OK
+
+
+@pytest.mark.parametrize("throttle,steering", [(None, 0.0), ("0.3", 0.0), (0.3, None)])
+def test_non_numeric_command_is_invalid_not_an_exception(sup, throttle, steering):
+    d = sup.evaluate(DriveCommand(throttle, steering, NOW), scan(), NOW)
+    assert d.reason is Reason.INVALID_COMMAND and d.throttle == 0.0
+
+
+def test_steering_corridor_must_stay_inside_coverage_fov():
+    with pytest.raises(ValueError):
+        SafetyConfig(max_steer_rad=math.radians(55), coverage_fov_rad=math.radians(120))

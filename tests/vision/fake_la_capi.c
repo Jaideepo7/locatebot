@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct la_ctx { char last_error[128]; } la_ctx;
 
@@ -30,6 +31,7 @@ void la_capi_free(la_ctx* c) { if (c) { free(c); fake_live_ctx--; } }
 char* la_capi_locate_buffer(la_ctx* c, const unsigned char* bytes, size_t len, const char* prompt, int mode) {
     if (!c) return NULL;
     if (strstr(prompt, "FAIL")) { snprintf(c->last_error, sizeof c->last_error, "fake failure"); return NULL; }
+    if (strstr(prompt, "SLOW")) usleep(300000);
     c->last_error[0] = '\0';
     char* out = malloc(512);
     snprintf(out, 512, "{\"detections\":[{\"label\":\"%s\",\"box\":[%zu,%d,%d,99]}]}",

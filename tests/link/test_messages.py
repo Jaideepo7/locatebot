@@ -187,3 +187,27 @@ def test_unexpected_payload_on_json_only_message_rejected():
 def test_encode_rejects_unknown_object():
     with pytest.raises(TypeError):
         encode("hello")
+
+
+# --- review fixes: every malformed input is a ProtocolError ------------------------
+
+def _hdr(**kw):
+    return json.dumps({"v": PROTOCOL_VERSION, **kw}).encode()
+
+
+@pytest.mark.parametrize("parts", [
+    [b"scan", _hdr(type="scan", stamp_s=float("nan"), seq=1, n=0), b""],
+    [b"frame", _hdr(type="frame", capture_s=float("inf"), seq=1), b"x"],
+    [b"drive", _hdr(type="drive", throttle=0.0, steering=0.0, seq=1, sent_s=float("nan")), b""],
+    [b"drive", b'{"v":1,"type":"drive","throttle":0,"steering":0,"seq":1,"sent_s":1' + b"0" * 400 + b"}", b""],
+])
+def test_non_finite_or_overflowing_times_are_protocol_errors(parts):
+    with pytest.raises(ProtocolError):
+        decode(parts)
+
+
+def test_encode_rejects_non_finite_times():
+    with pytest.raises(ProtocolError):
+        encode(Frame(b"x", capture_s=float("nan"), seq=1))
+    with pytest.raises(ProtocolError):
+        encode(DriveCmd(0.1, 0.0, seq=1, sent_s=float("inf")))

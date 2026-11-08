@@ -9,7 +9,11 @@ Policy (frozen):
 - Checks run in this order; the first failure wins: e-stop, clock, scan presence/age,
   command presence/age, command validity, reverse, forward coverage, obstacle distance.
 - Unknown is never free: missing or invalid beams lower ``forward_coverage``; below
-  ``min_coverage`` the car stops even if nothing was "seen".
+  ``min_coverage`` the car stops even if nothing was "seen". When moving, the corridor the
+  car is about to enter must also be covered (``corridor_min_coverage``, default every 2-degree
+  bin within the corridor's angular half-width at ``stop_distance_m``, for each checked
+  steering direction), so a small blind wedge ahead (black, glass or absorbing object) can't
+  hide behind a high global coverage.
 - Obstacles: the forward corridor (``half_width_m`` either side) is checked straight
   ahead and rotated towards the steering direction (0, 1/2, 1 x ``steering * max_steer_rad``)
   as a conservative stand-in for the swept arc, so turning can't dodge the check.
@@ -84,6 +88,7 @@ class SafetyConfig:
     scan_timeout_s: float = 0.5
     command_timeout_s: float = 0.3
     future_tolerance_s: float = 0.05
+    corridor_min_coverage: float = 1.0
 
     def __post_init__(self) -> None:
         if not 0.0 < self.stop_distance_m < self.slow_distance_m:
@@ -100,6 +105,15 @@ class SafetyConfig:
             raise ValueError("timeouts must be > 0 and future_tolerance_s >= 0")
         if not 0.0 <= self.max_steer_rad < math.pi / 2:
             raise ValueError("max_steer_rad must be in [0, pi/2)")
+        if not 0.0 < self.corridor_min_coverage <= 1.0:
+            raise ValueError("corridor_min_coverage must be in (0, 1]")
+        if self.max_steer_rad + self.corridor_half_angle_rad > self.coverage_fov_rad / 2 + 1e-9:
+            raise ValueError("steered corridor would leave coverage_fov_rad: reduce max_steer_rad "
+                             "or widen coverage_fov_rad")
+
+    @property
+    def corridor_half_angle_rad(self) -> float:
+        return math.atan2(self.half_width_m, self.stop_distance_m)
 
 
 def _stop(reason: Reason, clearance: float | None = None, coverage: float | None = None) -> SafetyDecision:
@@ -149,7 +163,11 @@ class SafetySupervisor:
         if command.stamp_s - now > c.future_tolerance_s:
             return _stop(Reason.COMMAND_FROM_FUTURE)
         t, s = command.throttle, command.steering
-        if not (math.isfinite(t) and math.isfinite(s) and abs(t) <= 1.0 and abs(s) <= 1.0):
+        try:
+            valid = math.isfinite(t) and math.isfinite(s) and abs(t) <= 1.0 and abs(s) <= 1.0
+        except TypeError:  # None, strings, ...: never let a bad value raise past the gate
+            valid = False
+        if not valid:
             return _stop(Reason.INVALID_COMMAND)
         if t < 0.0:
             return _stop(Reason.REVERSE_BLOCKED)
@@ -162,8 +180,11 @@ class SafetySupervisor:
             return SafetyDecision(0.0, s, Reason.OK, None, coverage)
 
         phi = s * c.max_steer_rad
-        clearance = min(corridor_clearance(_rotated(cleaned, k * phi), c.half_width_m)
-                        for k in (0.0, 0.5, 1.0))
+        steered = [_rotated(cleaned, k * phi) for k in (0.0, 0.5, 1.0)]
+        corridor_cov = min(forward_coverage(r, fov_rad=2 * c.corridor_half_angle_rad) for r in steered)
+        if corridor_cov < c.corridor_min_coverage:
+            return _stop(Reason.LOW_COVERAGE, coverage=min(coverage, corridor_cov))
+        clearance = min(corridor_clearance(r, c.half_width_m) for r in steered)
         if clearance <= c.stop_distance_m:
             return _stop(Reason.OBSTACLE, clearance, coverage)
 

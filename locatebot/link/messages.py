@@ -116,6 +116,10 @@ def _header(type_: str, **fields_) -> bytes:
                       separators=(",", ":")).encode()
 
 
+def _finite(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def _wire_value(v):
     return None if isinstance(v, float) and not math.isfinite(v) else v
 
@@ -132,13 +136,21 @@ def encode(msg) -> list[bytes]:
     if isinstance(msg, Frame):
         if len(msg.jpeg) > MAX_FRAME_BYTES:
             raise ProtocolError(f"frame of {len(msg.jpeg)} bytes exceeds {MAX_FRAME_BYTES}")
+        if not _finite(msg.capture_s):
+            raise ProtocolError(f"frame capture_s must be finite, got {msg.capture_s!r}")
         return [b"frame", _header("frame", capture_s=msg.capture_s, seq=msg.seq), bytes(msg.jpeg)]
     type_ = _TYPE_OF.get(type(msg))
     if type_ is None:
         raise TypeError(f"cannot encode {type(msg).__name__}")
     if isinstance(msg, DriveCmd):
         _check_drive(msg.throttle, msg.steering)
-    body = {f.name: _wire_value(getattr(msg, f.name)) for f in fields(msg)}
+    spec = _JSON_TYPES[type_][1]
+    body = {}
+    for f in fields(msg):
+        v = getattr(msg, f.name)
+        if spec[f.name] == "f" and not _finite(v):
+            raise ProtocolError(f"{type_}.{f.name} must be finite, got {v!r}")
+        body[f.name] = _wire_value(v)
     return [type_.encode(), _header(type_, **body), b""]
 
 
@@ -153,7 +165,13 @@ def _get(hdr: dict, key: str, kind: str):
     if kind in ("f", "f?"):
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             raise ProtocolError(f"{key} must be a number")
-        return float(v)
+        try:
+            f = float(v)
+        except OverflowError:
+            raise ProtocolError(f"{key} is out of range") from None
+        if not math.isfinite(f):
+            raise ProtocolError(f"{key} must be finite")
+        return f
     if kind == "i":
         if isinstance(v, bool) or not isinstance(v, int):
             raise ProtocolError(f"{key} must be an integer")

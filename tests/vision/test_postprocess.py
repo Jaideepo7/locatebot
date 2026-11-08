@@ -137,3 +137,27 @@ def test_jpeg_size_baseline_and_progressive():
 def test_jpeg_size_rejects_non_jpeg():
     with pytest.raises(ValueError):
         jpeg_size(b"\x89PNG\r\n\x1a\n")
+
+
+# --- review fixes ------------------------------------------------------------
+
+def test_parse_detections_rejects_non_finite_box():
+    with pytest.raises(ValueError):
+        parse_detections('{"detections":[{"label":"x","box":[NaN,0,1,1]}]}')
+
+
+def test_jpeg_size_truncated_sof_is_value_error():
+    with pytest.raises(ValueError):
+        jpeg_size(b"\xff\xd8\xff\xc0\x00\x11\x08\x01")
+
+
+def test_jpeg_size_rejects_zero_dimension():
+    with pytest.raises(ValueError):
+        jpeg_size(_fake_jpeg(0, 480))
+
+
+def test_camera_rejects_bad_fov_and_width():
+    with pytest.raises(ValueError):
+        Camera.from_hfov(640, 0.0)
+    with pytest.raises(ValueError):
+        Camera.from_hfov(0, 1.0)

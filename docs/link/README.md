@@ -25,4 +25,11 @@ Every header also has `"v": 1` and `"type"` (equal to the topic). `?` fields may
 ## Planned sockets
 - Pi PUB `tcp://*:5555`: `scan`, `frame`, `pi_status`. Orin SUB; frame subscriber uses `CONFLATE` (newest only).
 - Orin PUB `tcp://*:5556`: `drive`, `estop`, `orin_status`. Pi SUB.
+
+## Drive and e-stop rules for the transport (must hold before motors are connected)
+Re-stamping on receipt means the command timeout measures time since *arrival*, so the transport must not deliver old commands:
+- The Pi's drive subscriber uses `CONFLATE` (or a high-water mark of 1) so a reconnect or backlog can't flush a queue of stale commands.
+- Drop any drive command with `seq <= last_seq` (replayed or reordered). Reset `last_seq` only when the Orin's status shows it restarted.
+- Optionally drop a command whose estimated one-way latency (from `sent_s` and a measured clock offset) exceeds the command timeout.
+- `estop` with `engage=true` latches the Pi's e-stop. `engage=false` from the network **never** releases it; only a local action on the Pi (button or local dashboard command) does.
 - Fixed IPs on the direct Ethernet cable; never put real addresses in the repo.

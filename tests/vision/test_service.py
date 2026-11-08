@@ -247,3 +247,29 @@ def test_set_items_rejects_bad_names_and_strips_duplicates(make_service):
         svc.set_items(["ok", "a</c>b"])
     svc.set_items([" bolt ", "bolt", "marker"])
     assert svc.status()["items"] == ["bolt", "marker"]
+
+
+# --- review fixes ------------------------------------------------------------
+
+def test_worker_survives_postprocessing_error(make_service):
+    eng = FakeEngine(boxes=[(math.nan, 0.0, 10.0, 10.0)])
+    svc = make_service(eng)
+    svc.set_items(["a", "b"])
+    svc.submit_frame(jpeg(), capture_s=1.0)
+    assert wait_for(lambda: svc.status()["errors"] == 2)
+    assert svc.status()["alive"] is True
+    eng.boxes = [(310.0, 0.0, 330.0, 10.0)]
+    svc.submit_frame(jpeg(tag=1), capture_s=2.0)
+    assert wait_for(lambda: len(svc.results) == 2)
+
+
+@pytest.mark.parametrize("hfov", [0.0, -1.0, math.pi, math.nan])
+def test_service_rejects_bad_hfov(hfov):
+    with pytest.raises(ValueError):
+        VisionService(FakeEngine(), on_result=lambda r: None, hfov_rad=hfov)
+
+
+def test_truncated_frame_is_rejected_not_raised(make_service):
+    svc = make_service(FakeEngine())
+    svc.submit_frame(b"\xff\xd8\xff\xc0\x00\x11\x08\x01", capture_s=1.0)
+    assert "JPEG" in svc.status()["last_error"]

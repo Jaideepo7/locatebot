@@ -16,12 +16,13 @@ Transport (receiving frames from the Pi, publishing results) is not part of this
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
-from .postprocess import Box, Camera, Detection, bearing_rad, build_prompt, clean_detections, jpeg_size
+from .postprocess import Box, Camera, Detection, bearing_rad, build_prompt, check_hfov, clean_detections, jpeg_size
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class VisionService:
         on_heartbeat: Callable[[dict], None] | None = None,
         heartbeat_s: float = 1.0,
     ):
+        check_hfov(hfov_rad)
         self._engine = engine
         self._on_result = on_result
         self._on_heartbeat = on_heartbeat
@@ -180,11 +182,17 @@ class VisionService:
                 self._busy_item = item
 
             t0 = time.perf_counter()
+            found: list[Found] = []
             try:
                 dets = self._engine.locate(frame.jpeg, build_prompt(item), mode=self._mode)
+                cam = Camera.from_hfov(frame.width, self._hfov)
+                found = [Found(d.label, d.box, bearing_rad(d.box, cam))
+                         for d in clean_detections(dets, frame.width, frame.height)]
+                if not all(math.isfinite(f.bearing_rad) for f in found):
+                    raise ValueError("non-finite bearing")
                 error = None
-            except Exception as e:  # keep the worker alive whatever the engine does
-                dets, error = [], e
+            except Exception as e:  # keep the worker alive whatever the engine or post-processing does
+                error = e
             latency = time.perf_counter() - t0
 
             with self._cond:
@@ -200,9 +208,6 @@ class VisionService:
                     self._stats["results_discarded"] += 1
                     continue
 
-            cam = Camera.from_hfov(frame.width, self._hfov)
-            found = [Found(d.label, d.box, bearing_rad(d.box, cam))
-                     for d in clean_detections(dets, frame.width, frame.height)]
             result = VisionResult(item, frame.capture_s, frame.width, frame.height, found,
                                   round(latency, 3), self._mode)
             try:

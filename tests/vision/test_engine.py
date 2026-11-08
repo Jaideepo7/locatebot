@@ -122,3 +122,24 @@ def test_find_library_searches_build_tree(tmp_path):
 def test_find_library_missing_raises(tmp_path):
     with pytest.raises(FileNotFoundError, match="build_locate_anything"):
         find_library(tmp_path)
+
+
+def test_close_waits_for_in_flight_locate(fake_lib, model, counters):
+    import threading
+    import time
+    eng = LocateEngine(model, lib_path=fake_lib)
+    out = {}
+
+    def run():
+        out["dets"] = eng.locate(b"x", "SLOW")
+        out["done"] = time.perf_counter()
+
+    t = threading.Thread(target=run)
+    t.start()
+    time.sleep(0.05)
+    eng.close()  # must not free the context under the running call
+    closed = time.perf_counter()
+    t.join(2)
+    assert out["dets"][0].label == "SLOW"
+    assert closed >= out["done"]
+    assert counters["fake_live_ctx"].value == 0

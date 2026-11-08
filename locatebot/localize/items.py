@@ -80,6 +80,8 @@ class PoseHistory:
         self._p: list[Pose2D] = []
 
     def add(self, stamp_s: float, pose: Pose2D) -> None:
+        if not all(math.isfinite(v) for v in (stamp_s, pose.x, pose.y, pose.theta)):
+            raise ValueError("pose history entries must be finite")
         if self._t and stamp_s < self._t[-1]:
             raise ValueError("poses must be added in time order")
         self._t.append(stamp_s)
@@ -89,7 +91,7 @@ class PoseHistory:
             del self._t[:cut], self._p[:cut]
 
     def at(self, stamp_s: float) -> Pose2D | None:
-        if not self._t:
+        if not self._t or not math.isfinite(stamp_s):
             return None
         if stamp_s <= self._t[0]:
             return self._p[0] if self._t[0] - stamp_s <= self.max_extrapolation_s else None
@@ -104,9 +106,14 @@ class PoseHistory:
 
 
 class ScanHistory:
-    """Recent scans, to find the one closest to a frame's capture time."""
+    """Recent scans, to find the one closest to a frame's capture time.
 
-    def __init__(self, max_dt_s: float = 0.15, maxlen: int = 50):
+    Keep ``max_dt_s`` small (about half the scan period): the bearing is in the robot frame at
+    the frame's capture time but the ray is searched in the scan's frame, so a time gap while
+    turning becomes a bearing error (1 rad/s for 0.06 s is about 3.4 degrees).
+    """
+
+    def __init__(self, max_dt_s: float = 0.06, maxlen: int = 50):
         self.max_dt_s = max_dt_s
         self._scans: deque[Scan] = deque(maxlen=maxlen)
 
@@ -118,6 +125,9 @@ class ScanHistory:
             return None
         best = min(self._scans, key=lambda s: abs(s.stamp_s - stamp_s))
         return best if abs(best.stamp_s - stamp_s) <= self.max_dt_s else None
+
+
+_MIN_SIGMA = 1e-3  # metres; guards the inverse-variance weights
 
 
 @dataclass
@@ -149,7 +159,7 @@ class ItemTracker:
         near = [(d, t) for d, t in near if d <= self.merge_radius_m]
         if near:
             _, t = min(near, key=lambda dt: dt[0])
-            w1, w2 = 1.0 / t.sigma_m ** 2, 1.0 / fix.sigma_m ** 2
+            w1, w2 = 1.0 / max(t.sigma_m, _MIN_SIGMA) ** 2, 1.0 / max(fix.sigma_m, _MIN_SIGMA) ** 2
             t.x = (w1 * t.x + w2 * fix.x) / (w1 + w2)
             t.y = (w1 * t.y + w2 * fix.y) / (w1 + w2)
             t.sigma_m = math.sqrt(1.0 / (w1 + w2))

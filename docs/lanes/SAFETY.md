@@ -1,3 +1,5 @@
+> **Superseded:** the safety supervisor is built in `locatebot/safety/supervisor.py`; see `docs/safety/README.md`. This file is the original plan and its paths are outdated.
+
 # Lane A — LiDAR validation and safety supervisor
 
 **Status: planned only. Branch: feat/safety. Human/agent owner: unassigned.**

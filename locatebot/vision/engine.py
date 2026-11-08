@@ -3,11 +3,13 @@
 The model is loaded once by ``LocateEngine(...)`` and stays in memory until ``close()``;
 each ``locate()`` call runs one detection on JPEG/PNG bytes. Calls block until the model
 finishes and cannot be cancelled, so the vision daemon must run them in a background
-worker. One engine is not safe to use from several threads at once.
+worker. Calls are serialised by a lock, and ``close()`` waits for a running call to finish
+so the C context is never freed underneath it.
 """
 from __future__ import annotations
 
 import ctypes
+import threading
 from pathlib import Path
 
 from .postprocess import Detection, parse_detections
@@ -53,6 +55,8 @@ class LocateEngine:
         model_path = Path(model_path)
         if not model_path.is_file():
             raise FileNotFoundError(f"model not found: {model_path}; run scripts/get_model.sh")
+        self._lock = threading.Lock()
+        self._ctx = None
         self._lib = ctypes.CDLL(str(lib_path))
         _bind(self._lib)
         abi = self._lib.la_capi_abi_version()
@@ -66,22 +70,24 @@ class LocateEngine:
         """Run one detection. ``prompt`` is the full prompt (see ``postprocess.build_prompt``)."""
         if mode not in MODES:
             raise ValueError(f"mode must be one of {sorted(MODES)}, got {mode!r}")
-        if not self._ctx:
-            raise EngineError("engine is closed")
-        ptr = self._lib.la_capi_locate_buffer(self._ctx, image, len(image), prompt.encode(), MODES[mode])
-        if not ptr:
-            err = (self._lib.la_capi_last_error(self._ctx) or b"").decode(errors="replace")
-            raise EngineError(f"locate failed: {err or 'unknown error'}")
-        try:
-            raw = ctypes.string_at(ptr).decode()
-        finally:
-            self._lib.la_capi_free_string(ptr)
+        with self._lock:
+            if not self._ctx:
+                raise EngineError("engine is closed")
+            ptr = self._lib.la_capi_locate_buffer(self._ctx, image, len(image), prompt.encode(), MODES[mode])
+            if not ptr:
+                err = (self._lib.la_capi_last_error(self._ctx) or b"").decode(errors="replace")
+                raise EngineError(f"locate failed: {err or 'unknown error'}")
+            try:
+                raw = ctypes.string_at(ptr).decode()
+            finally:
+                self._lib.la_capi_free_string(ptr)
         return parse_detections(raw)
 
     def close(self) -> None:
-        if self._ctx:
-            self._lib.la_capi_free(self._ctx)
-            self._ctx = None
+        with self._lock:
+            if self._ctx:
+                self._lib.la_capi_free(self._ctx)
+                self._ctx = None
 
     def __enter__(self) -> "LocateEngine":
         return self
