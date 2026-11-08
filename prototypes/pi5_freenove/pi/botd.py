@@ -8,6 +8,7 @@ Tools (GET, JSON unless noted)
   /state                                   sensors, mission, recent events
   /stop                                    cancel the mission, motors off
   /wander?seconds=60&speed=40              roam + avoid + event photos (returns at once)
+  /wander?head=1&seconds=120               cute wander: camera head sweeps, looks before turning, look-arounds
   /approach?speed=40&seconds=6&hold=1      drive forward until ~20 cm from something; hold=1 keeps the
                                            starting heading using LiDAR scan matching (course correction)
   /back?seconds=0.4                        short reverse (no rear check - keep it short)
@@ -399,7 +400,7 @@ class Bot:
             "last_result": self.last_result,
             "front_cm": r(st.clear), "front_source": st.src, "sonar_cm": r(st.sonar_cm),
             "lidar_lane_cm": r(st.lidar_cm), "rear_cm": r(getattr(st, "rear_cm", None)),
-            "lidar_body_hits": getattr(st, "body_hits", None),
+            "lidar_body_hits": getattr(st, "body_hits", None), "pan_us": getattr(st, "pan_us", None),
             "nearest_lidar_deg_cm": nearest_objects(free_bins(st), k=6),
             "speed_cmd": round(st.cmd, 2), "turn": round(st.turn, 2),
             "heading_err_deg": round(getattr(st, "heading_err", 0.0) or 0.0, 1), "turn_rates": dict(self.TURN_RATE),
@@ -635,9 +636,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"ok": True, "stopped": True, "loop_ok": False})
                 b.log("STOP (operator)")
                 return self._send(200, {"ok": True, "stopped": True})
-            if p == "/wander":
-                secs, spd = min(f("seconds", 60), MAX_WANDER_S), min(f("speed", 40), 60)
-                return self._send(200, self._call(b.start("wander", lambda: wander(b.st, spd, secs))))
+            if p == "/wander":                     # head=1: cute mode (camera head sweeps, looks before turning)
+                cute = q.get("head") == "1"
+                secs, spd = min(f("seconds", 60), MAX_WANDER_S), min(f("speed", 34 if cute else 40), 40 if cute else 60)
+                return self._send(200, self._call(b.start("wander", lambda: wander(b.st, spd, secs, cute=cute))))
             if p == "/approach":
                 secs, spd = min(f("seconds", 6), MAX_APPROACH_S), min(f("speed", 40), 60)
                 if q.get("hold", "1") != "0":

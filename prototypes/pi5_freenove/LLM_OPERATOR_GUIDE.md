@@ -41,7 +41,7 @@ All GET unless marked POST; JSON unless noted. Missions are exclusive: starting 
 | `/aim?rel=-3&visual=1` / `/aim?keep=1` | Update a running `/goto`'s direction / just feed the watchdog | |
 | `/back?seconds=0.4` | Short reverse (max 0.8 s) | No rear check: keep it short |
 | `/approach?speed=40&seconds=6` | Drive forward until ~20 cm from something | |
-| `/wander?seconds=60&speed=40` | Roam and avoid on its own | Weak around people: see §4 |
+| `/wander?seconds=60&speed=40` | Roam and avoid on its own | `head=1`: cute mode (camera head sweeps, looks before turning, look-arounds, corner escape; 34 % default). Weak around people: see §4 |
 | `/manual?l=0.4&r=0.4` | Raw wheel power for ~0.35 s (the app's joystick) | Capped ±0.55; forward refused near obstacles or with no distance reading. Prefer `/goto` + `/pulses` yourself |
 | `/pan?deg=-20`, `/beep?ms=150` | Camera pan, horn | |
 | `/stream` | MJPEG live video | Small frames automatically through a tunnel |
@@ -56,7 +56,7 @@ Helpers on the laptop: `laptop/choose.py` (find and drive), `laptop/qa.py` (app 
 2. **botd alive:** `/state` → `control_age_s` below 1. A huge value means the control loop isn't running: don't drive.
 3. **Motor power:** `battery_adc` above 0. A reading of 0 means the battery switch is off, so the wheels won't turn even though everything else works.
 4. **I2C health:** `control_errs` should not climb by more than a few per minute. `control_err: OSError(121, …)` is the motor chip's bus.
-5. **Distance sensors:** `front_cm` is a number (not `null`), and `/bins` front matches what `/snap` shows. A front near 0 or negative with nothing there means the LiDAR sees the car itself, or `lidar_front_deg` is wrong after a remount.
+5. **Distance sensors:** `front_cm` is a number (not `null`), and `/bins` front matches what `/snap` shows and the ultrasonic. A front near 0 or negative with nothing there means the LiDAR sees the car itself; a "wall" ahead that the camera and ultrasonic don't see means `lidar_front_deg` is wrong (the LiDAR was turned). **After anyone touches the LiDAR:** drive 1 s straight (`/goto?bearing=0&seconds=1&speed=30&visual=1`) in open space; the front slices (0°, ±10°) must shrink and the rear (180°, ±170°) grow. If it's the other way round, add or subtract 180° in `calibration.json` and restart botd.
 6. **Who runs botd?** `ssh $CAR_SSH 'pgrep -af botd.py; systemctl --user list-units --all | grep -i botd'`. Another agent may be managing it (§8).
 7. **Stop works:** `/stop` answers in well under a second.
 
@@ -157,7 +157,7 @@ POST /detections {"label": "keys", "boxes": [[x0, y0, x1, y1]], "w": 960, "h": 5
 |---|---|---|
 | `/stop` hangs, `control_age_s` huge | Event loop blocked (old botd: unpowered ultrasonic froze it) | Use current `motion.py` (`partial=True`); restart botd |
 | `front_cm` ≤ 0, forward always "blocked" | LiDAR sees the car itself / wrong front angle | `/bins`, `/state.lidar_body_hits`; check for a loose wire near the LiDAR; recheck `lidar_front_deg` |
-| Wheels don't turn, all else fine | Battery switch off (`battery_adc` 0), or a `motion.py` that latches a fault after a failed motor write (a version on the car did, as `reason: control_fault`) | Switch on; check `control_err` and the last result; restart botd to clear a latch |
+| Wheels don't turn, all else fine | Battery switch off (`battery_adc` 0), or the control loop latched a fault after a failed motor write (`reason: control_fault`) | Switch on; check `control_err` and the last result; restart botd to clear the latch |
 | `control_errs` climbing | I2C bus contention / wiring | Fewer concurrent I2C users; check wiring; it may latch a fault |
 | HTTP timeouts but `ping` works | botd restarting (maybe someone else) or a Wi-Fi blip | Retry; check `systemctl --user` and `/tmp/botd.log` |
 | Box on the live video cut off at the top | Horizon-strip detection (y 100–370) | Already handled for scans; detect the whole frame at 640 px |
