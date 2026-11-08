@@ -46,5 +46,13 @@ The times include loading the 4.7 GB model on every CLI call and are CPU-only, s
 - Expect near-duplicate boxes for the same object: merge same-label boxes that overlap heavily (IoU > 0.7) in the wrapper.
 - Some prompts returned a whole-image box when the object was absent or ambiguous; the wrapper must reject boxes covering most of the frame.
 
-## Next: Python wrapper (not built yet)
-The engine has a C API (`include/la_capi.h`): `la_capi_load` once, then `la_capi_locate_buffer(ctx, jpeg_bytes, len, prompt, mode)` per photo, so the 4.7 GB model stays loaded. Plan: `locatebot/vision/` with a ctypes binding, a background worker that keeps only the newest photo, and box→bearing conversion from the camera's field of view for placing items on the LiDAR map.
+## Python wrapper (built, tested against a fake engine)
+- `locatebot/vision/engine.py`: `LocateEngine(model, lib_path)` loads the model once via the C API (ABI v1); `locate(jpeg_bytes, prompt, mode)` returns `Detection`s with pixel boxes. Calls block and can't be cancelled: run them in a background worker.
+- `locatebot/vision/postprocess.py`: `build_prompt` (one item per prompt), `merge_duplicates` (same label, IoU > 0.7), `drop_oversized` (> 80 % of frame), `bearing_rad` (robot frame, left positive), `jpeg_size`.
+- `tools/locate.py`: time real photos with the model loaded once:
+  ```bash
+  .venv/bin/python tools/locate.py photos/desk.jpg="tape measure,marker" --mode hybrid --repeat 2 --out results/run1.json
+  ```
+- Tests (`tests/vision/`) compile `fake_la_capi.c` into a fake `liblocate_anything.so`; they prove the binding, not the real model or the Orin GPU build.
+
+Next: the vision daemon (`service.py`: newest-frame worker, item rotation, heartbeat).
