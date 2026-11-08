@@ -82,5 +82,5 @@ Keep the wheels off the ground for first runs and a hand near the car; there is 
 - `laptop/lr_check.py`'s phase correlation gave the **wrong** left/right answer once (low correlation peak); compare photos visually instead.
 - Battery ADC is uncalibrated.
 
-## Toward `locatebot.pi.MotorDriver`
-A real driver for this board would implement `set(throttle, steering)` (both [-1, 1], +steering = left) as skid steering, e.g. `left = throttle - k·steering`, `right = throttle + k·steering`, clamp each side to [-1, 1], and map each wheel through the forward-channel table above (`car.Car._wheel` shows the mapping and the duty floor). `stop()` = all channels 0–7 off (or a 0.15 s short-brake then off); it must not touch ch 8/9 so the camera keeps its pose. It still needs the hardware failsafe above. Not written yet.
+## `locatebot.pi.MotorDriver` for this board
+`locatebot/pi/pca9685_motor.py` (`PCA9685SkidSteer`, tests in `tests/pi/test_pca9685_motor.py`) implements the package's `MotorDriver` for this board: `set(throttle, steering)` (package frame, +steering = left) becomes `left = throttle - steering`, `right = throttle + steering`, scaled to keep the ratio, mapped through the forward-channel table above with a 700/4095 duty floor; `stop()` turns channels 0–7 off in one I2C write and never touches the camera servos; `brake()` short-brakes. It is tested against a fake I2C bus only: it has **not** driven the car yet and is not wired into `tools/pi_drive.py`. It still needs the hardware failsafe above.
