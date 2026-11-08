@@ -1,0 +1,19 @@
+{
+  "name": "my-spectrum-app",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@spectrum-ts/telegram": "^12.15.0",
+    "spectrum-ts": "^12.15.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
