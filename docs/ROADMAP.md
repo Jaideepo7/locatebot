@@ -24,7 +24,7 @@ LiDAR driver (verified on the real C1), mapping + `.lbmap`, scan matching, safet
 | D1 | Motor/steering hardware: ESC + steering servo, H-bridge + servo, or a motor HAT? Which Pi pins? | T1.1 |
 | D2 | Where the LiDAR lives on the car: **Pi** (design: safety stop next to the motors) or Orin (current bench setup). Collision detection on the Pi needs the LiDAR on the Pi. Recommended: Pi. | T1.2, T1.3 |
 | D3 | Pi 4 RAM size (2/4/8 GB) and OS (must be 64-bit for SpacetimeDB) | T3.1 placement |
-| D4 | LLM: Claude API over a phone hotspot (best, needs internet) or local model on the laptop | T5.1 |
+| D4 | **Decided 2026-11-08: Nemotron through NVIDIA's API** (OpenAI-compatible `https://integrate.api.nvidia.com/v1`, key in `NVIDIA_API_KEY`): `tools/orin_run.py --llm nemotron --llm-model <id>`. Still open: which model id (must support tool calling), and internet at the event (D5). The LLM chooses skills; it never sends throttle/steering. | G5 |
 | D5 | Telegram remote control at the event needs internet; is a hotspot allowed? | R tasks go live |
 | D6 | Camera model and mount (USB webcam or Pi camera module) | T1.4, T2.4 |
 
@@ -169,7 +169,7 @@ Leg-pair/blob tracker with velocity (Kalman or α-β), `WorldState.people`; came
 ---
 
 ## G5 — LLM live [needs G2, D4, R4]
-Run `ClaudeClient` (or the local model) against the real robot in **approve** mode; log every prompt/answer; tune the system prompt on 10 real missions; measure latency and cost; confirm fallback (pull the hotspot mid-mission → robot finishes the skill and stops). Context: `docs/agent/README.md`, `locatebot/agent/llm.py`.
+Pick the Nemotron model id on build.nvidia.com that supports tool calling; check the reply parser handles its output (some Nemotron reasoning models also return `reasoning_content`, and some take a system-prompt switch for reasoning on/off); measure decision latency. Run it against the real robot in **approve** mode; log every prompt/answer; tune the system prompt on 10 real missions; measure latency and cost; confirm fallback (pull the hotspot mid-mission → robot finishes the skill and stops). Context: `docs/agent/README.md`, `locatebot/agent/llm.py`.
 
 ## G6 — event-ready [needs everything above]
 systemd units with auto-restart and `MemoryMax=` (Pi: `pi_run`, `remote_run`, SpacetimeDB; Orin: `orin_run` with vision); boot order and health checks; offline kit (wheels/pip cache, npm bundle, model, SpacetimeDB binary on both devices); full dry run with Wi-Fi off (local dashboard only); failure drills (cable, Orin, LLM, Telegram, SpacetimeDB down); battery plan; demo script.

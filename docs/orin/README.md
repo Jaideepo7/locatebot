@@ -23,7 +23,7 @@
 # The car: scans/frames from the Pi, drive commands back, vision on, LLM proposals need approval
 .venv/bin/python tools/orin_run.py --pi-host <pi-address> --vision --llm claude --mode approve --host 0.0.0.0
 ```
-`--llm claude` reads `ANTHROPIC_API_KEY` from the environment and needs internet (the open question in `docs/PROJECT.md` §8a). `--llm local` talks to an OpenAI-compatible server (`--llm-url`, `--llm-model`). With `--llm none` the operator sends skills from the page.
+`--llm nemotron --llm-model <id>` (the team's choice) uses NVIDIA's OpenAI-compatible API at `https://integrate.api.nvidia.com/v1` with the key from `NVIDIA_API_KEY`; the model id comes from build.nvidia.com and must support tool calling. `--llm claude` reads `ANTHROPIC_API_KEY` from the environment and needs internet (the open question in `docs/PROJECT.md` §8a). `--llm local` talks to an OpenAI-compatible server (`--llm-url`, `--llm-model`). With `--llm none` the operator sends skills from the page.
 
 ## Skills (`SkillExecutor`)
 - `stop`; `go_to` a point or an item (stops `standoff_m` short); `return_home` (session start pose).

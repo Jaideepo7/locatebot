@@ -10,6 +10,8 @@ LLM (optional):
   --llm none     operator only: send skills from the page (default)
   --llm claude   Anthropic API, key from the ANTHROPIC_API_KEY env var (needs internet)
   --llm local    OpenAI-compatible server, e.g. Ollama: --llm-url http://127.0.0.1:11434/v1 --llm-model <m>
+  --llm nemotron NVIDIA API (OpenAI-compatible, https://integrate.api.nvidia.com/v1), key from the
+                 NVIDIA_API_KEY env var, model id from build.nvidia.com: --llm-model <id> (required)
   --mode approve (default): the operator approves each LLM call on the page; --mode auto runs them.
 
 Vision (optional, needs camera frames, i.e. --pi-host): --vision [--model ... --lib ...]
@@ -150,13 +152,22 @@ class DryRunSink:
 
 
 # ---------------------------------------------------------------------- wiring
+NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1"
+
+
 def make_llm(args):
     if args.llm == "none":
         return None
     from locatebot.agent.llm import ClaudeClient, OpenAICompatClient
     if args.llm == "claude":
         return ClaudeClient(model=args.llm_model) if args.llm_model else ClaudeClient()
-    return OpenAICompatClient(base_url=args.llm_url, model=args.llm_model or "qwen2.5:7b-instruct")
+    if args.llm == "nemotron":
+        if not args.llm_model:
+            raise SystemExit("--llm nemotron needs --llm-model <model id from build.nvidia.com>")
+        return OpenAICompatClient(base_url=args.llm_url or NVIDIA_API_URL, model=args.llm_model,
+                                  api_key_env="NVIDIA_API_KEY")
+    return OpenAICompatClient(base_url=args.llm_url or "http://127.0.0.1:11434/v1",
+                              model=args.llm_model or "qwen2.5:7b-instruct")
 
 
 def main(argv=None) -> int:
@@ -167,9 +178,9 @@ def main(argv=None) -> int:
     src.add_argument("--pi-host")
     ap.add_argument("--baud", type=int, default=460800)
     ap.add_argument("--mount-offset-deg", type=float, default=0.0)
-    ap.add_argument("--llm", choices=["none", "claude", "local"], default="none")
+    ap.add_argument("--llm", choices=["none", "claude", "local", "nemotron"], default="none")
     ap.add_argument("--llm-model")
-    ap.add_argument("--llm-url", default="http://127.0.0.1:11434/v1")
+    ap.add_argument("--llm-url", help="override the server URL (local: Ollama default; nemotron: NVIDIA API)")
     ap.add_argument("--mode", choices=["approve", "auto"], default="approve")
     ap.add_argument("--vision", action="store_true", help="run LocateAnything on frames from the Pi")
     ap.add_argument("--model", type=Path, default=ROOT / "models" / "locate-anything-q4_k.gguf")

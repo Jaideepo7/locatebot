@@ -178,3 +178,25 @@ def test_scan_json_without_scans_and_downsampling():
     assert scan_json(empty)["a"] == []
     s = scan_json(runtime_with_map(), max_points=50)
     assert len(s["a"]) == 50 and s["n_valid"] > 50
+
+
+def _orin_run_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("orin_run", ROOT / "tools" / "orin_run.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_nemotron_preset_uses_nvidia_api_and_key_env(monkeypatch):
+    import argparse
+    mod = _orin_run_module()
+    llm = mod.make_llm(argparse.Namespace(llm="nemotron", llm_model="nvidia/some-nemotron", llm_url=None))
+    assert llm.url == "https://integrate.api.nvidia.com/v1/chat/completions"
+    assert llm.model == "nvidia/some-nemotron" and llm.api_key_env == "NVIDIA_API_KEY"
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+    headers, body = llm.build_request("sys", "user", [])
+    assert body["model"] == "nvidia/some-nemotron" and body["tool_choice"] == "auto"
+    assert any(v == "Bearer nvapi-test" for v in headers.values())
+    with pytest.raises(SystemExit):
+        mod.make_llm(argparse.Namespace(llm="nemotron", llm_model=None, llm_url=None))
