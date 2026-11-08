@@ -70,17 +70,20 @@ class OccupancyGrid:
         return cr[:, 1] * self.width + cr[:, 0]
 
     # --- updates -----------------------------------------------------------------------------
-    def integrate(self, scan: Scan, pose: Pose2D, max_range_m: float = RANGE_MAX_M) -> None:
-        """Integrate one scan taken at ``pose`` (robot pose in the map frame).
+    def ray_masks(self, scan: Scan, pose: Pose2D, max_range_m: float = RANGE_MAX_M,
+                  beam_mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray] | None:
+        """Flat (H*W,) bool masks ``(free, occ)`` of the cells one scan would update.
 
-        Valid returns (finite, within [RANGE_MIN_M, max_range_m]) mark their endpoint cell with
-        l_occ and every cell sampled along the ray before it with l_free. Each cell gets at most one
-        update of each kind per scan; a cell hit by any endpoint in this scan is not also freed.
-        NaN / out-of-range beams change nothing. Cells outside the grid are ignored.
+        Same ray model as ``integrate``: valid returns (finite, within [RANGE_MIN_M, max_range_m])
+        mark their endpoint cell occupied and every cell sampled along the ray before it free;
+        a cell hit by any endpoint is not also freed. ``beam_mask`` (bool per beam) restricts
+        the update to those beams. Returns None when no beam is used.
         """
         mask = scan.valid_mask(RANGE_MIN_M, max_range_m)
+        if beam_mask is not None:
+            mask = mask & np.asarray(beam_mask, dtype=bool)
         if not np.any(mask):
-            return
+            return None
         r = scan.ranges_m[mask]
         a = scan.angles_rad[mask] + pose.theta
         dx, dy = np.cos(a), np.sin(a)
@@ -101,12 +104,47 @@ class OccupancyGrid:
         free = np.zeros(size, dtype=bool)
         free[self._flat(self.world_to_cell(samples))] = True  # boolean scatter == dedupe
         free &= ~occ
+        return free, occ
 
+    def integrate(self, scan: Scan, pose: Pose2D, max_range_m: float = RANGE_MAX_M) -> None:
+        """Integrate one scan taken at ``pose`` (robot pose in the map frame).
+
+        Valid returns (finite, within [RANGE_MIN_M, max_range_m]) mark their endpoint cell with
+        l_occ and every cell sampled along the ray before it with l_free. Each cell gets at most one
+        update of each kind per scan; a cell hit by any endpoint in this scan is not also freed.
+        NaN / out-of-range beams change nothing. Cells outside the grid are ignored.
+        """
+        masks = self.ray_masks(scan, pose, max_range_m)
+        if masks is None:
+            return
+        free, occ = masks
         lo = self.log_odds.reshape(-1)  # view
         lo[free] += np.float32(self.l_free)
         lo[occ] += np.float32(self.l_occ)
         touched = free | occ
         lo[touched] = np.clip(lo[touched], self.l_min, self.l_max)
+
+    def integrate_slow(self, scan: Scan, pose: Pose2D, rate: float = 0.2, confident_abs: float = 1.5,
+                       max_range_m: float = RANGE_MAX_M, beam_mask: np.ndarray | None = None) -> None:
+        """``integrate`` with damped increments for cells that are already confident.
+
+        For a "semi-constant" map that keeps improving across sessions: cells with
+        ``|log_odds| >= confident_abs`` (default 1.5, p < 0.18 or p > 0.82) move by ``rate`` x the
+        normal increment, other (unknown / weakly known) cells by the full increment. Same ray
+        model and clamps as ``integrate``; ``beam_mask`` skips beams (M2: endpoints classified as
+        new/moving). ``integrate`` itself is unchanged.
+        """
+        if not 0.0 <= rate <= 1.0:
+            raise ValueError("rate must be in [0, 1]")
+        masks = self.ray_masks(scan, pose, max_range_m, beam_mask)
+        if masks is None:
+            return
+        free, occ = masks
+        lo = self.log_odds.reshape(-1)  # view
+        touched = free | occ
+        scale = np.where(np.abs(lo[touched]) >= confident_abs, np.float32(rate), np.float32(1.0))
+        inc = np.where(occ[touched], np.float32(self.l_occ), np.float32(self.l_free)) * scale
+        lo[touched] = np.clip(lo[touched] + inc.astype(np.float32), self.l_min, self.l_max)
 
     # --- queries -----------------------------------------------------------------------------
     def probability(self) -> np.ndarray:
@@ -119,3 +157,8 @@ class OccupancyGrid:
         out[p < free_threshold] = FREE
         out[p > occ_threshold] = OCCUPIED
         return out
+
+
+def integrate_slow(grid: OccupancyGrid, scan: Scan, pose: Pose2D, rate: float = 0.2, **kw) -> None:
+    """Function form of ``OccupancyGrid.integrate_slow`` (slow "semi-constant" map update)."""
+    grid.integrate_slow(scan, pose, rate=rate, **kw)
