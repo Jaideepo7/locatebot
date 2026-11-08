@@ -36,6 +36,9 @@
 ## LLM and the `continue` tool
 The brain wakes the LLM on events (an item confirmed, a skill ended, a safety stop). If the running skill is still right the LLM answers `continue`; re-calling the running skill also counts as continue (it is not restarted). Without this, mid-skill wake-ups either restarted the skill or counted as failures and tripped the fallback STOP (found by the end-to-end simulation).
 
+## Goal (R4)
+`OrinRuntime.set_goal(text, source="operator")` / `clear_goal()` hold what the operator (or, from R3, a Telegram customer) wants, e.g. "find the bolt". It is validated (`normalize_goal`), timestamped, thread-safe, recorded as an event (`goal set: ... (by operator)` / `goal cleared`) and put into `WorldState.goal`, which the LLM sees as the first line of its state. A new goal wakes the brain. An operator STOP still pauses the brain: setting a goal does not resume it (`/resume` does).
+
 ## Timing (measured)
 | Per tick | x86 laptop | Orin Nano CPU |
 |---|---|---|
@@ -48,7 +51,7 @@ Scans, the 10 Hz control step and the 20 Hz drive sender run on separate threads
 Scans and frames from the Pi carry Pi monotonic stamps. `PeerClock` estimates the Pi-minus-Orin offset (running maximum of `stamp - receive time`, slowly decayed) so the runtime runs on the Pi timeline. Local LiDAR and `--sim` use the Orin clock directly.
 
 ## Operator page
-`GET /` page (inline, no CDN, CSP blocks external assets), `GET /status`, `GET /map.png`, `POST /skill {name, args}`, `/stop`, `/approve`, `/reject`, `/resume`, `/mode {mode}`, `/save_map {name}`. POSTs must be `application/json`. No login: keep it on the team network. Checked in headless Chromium (form -> search running, no JS errors).
+`GET /` page (inline, no CDN, CSP blocks external assets), `GET /status`, `GET /map.png`, `POST /skill {name, args}`, `/stop`, `/approve`, `/reject`, `/resume`, `/mode {mode}`, `/save_map {name}`, `/goal {text}` (1–200 chars after whitespace collapse, no control characters, else 400), `/goal/clear`. The page has a goal box with "Set goal" / "Clear"; `/status` has `goal: {text, source, set_s}` or `null`. POSTs must be `application/json`. No login: keep it on the team network. Checked in headless Chromium (form -> search running, no JS errors).
 
 ## Tests
 `tests/orin/`: live map, world state, 21 closed-loop skill tests (bicycle model, simulated LiDAR building the grid, fake vision with FOV and occlusion, no-collision checks), end-to-end (scripted LLM -> search -> go_to -> stop with scan-matching odometry, the real vision worker and localization: items mapped within 0.1 m), app threads/HTTP and an `orin_run.py --sim` smoke test.

@@ -25,6 +25,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
+from locatebot.agent.summary import one_line
 from locatebot.lidar.types import Pose2D, Scan
 from locatebot.localize.items import ItemTracker, LocalizeConfig, localize
 from locatebot.mission.types import SkillCall, SkillName, SkillState, WorldState
@@ -35,6 +36,23 @@ from .skills import DriveOutput, SkillExecutor, TickInput
 from .world import build_world_state
 
 log = logging.getLogger(__name__)
+
+
+MAX_GOAL_CHARS = 200
+
+
+def normalize_goal(text: str) -> str:
+    """Strip, collapse whitespace, 1-200 chars, no control characters. Raises ValueError."""
+    if not isinstance(text, str):
+        raise ValueError("goal must be a string")
+    goal = " ".join(text.split())
+    if not goal:
+        raise ValueError("goal must not be empty")
+    if len(goal) > MAX_GOAL_CHARS:
+        raise ValueError(f"goal must be at most {MAX_GOAL_CHARS} characters")
+    if any(not ch.isprintable() for ch in goal):
+        raise ValueError("goal must not contain control characters")
+    return goal
 
 
 @dataclass(frozen=True)
@@ -65,6 +83,9 @@ class OrinRuntime:
         self._last_state = self.executor.status.state
         self._confirmed: set[str] = set()
         self._stats = {"scans": 0, "frames": 0, "vision_results": 0, "fixes": 0, "no_range": 0, "steps": 0}
+        self._goal = ""               # what the operator / a Telegram customer wants, in words
+        self._goal_source = ""
+        self._goal_set_s: float | None = None
 
     # ------------------------------------------------------------------ inputs (any thread)
     def on_scan(self, scan: Scan) -> None:
@@ -109,6 +130,28 @@ class OrinRuntime:
             self.brain.submit_operator(call)
         else:
             self.on_skill(replace(call, source="operator"))
+
+    def set_goal(self, text: str, source: str = "operator") -> str:
+        """Set the goal the LLM works towards (shown first in its world state). Returns the
+        normalised text; raises ValueError for an invalid goal. A new goal wakes the brain."""
+        goal = normalize_goal(text)
+        source = one_line(source, 20) or "operator"
+        with self._lock:
+            self._goal, self._goal_source, self._goal_set_s = goal, source, self.clock()
+            self._event(self._goal_set_s, f"goal set: {one_line(goal, 80)} (by {source})")
+        return goal
+
+    def clear_goal(self) -> None:
+        with self._lock:
+            if not self._goal:
+                return
+            self._goal, self._goal_source, self._goal_set_s = "", "", None
+            self._event(self.clock(), "goal cleared")
+
+    @property
+    def goal(self) -> str:
+        with self._lock:
+            return self._goal
 
     def set_safety_reason(self, reason: str) -> None:
         with self._lock:
@@ -159,7 +202,7 @@ class OrinRuntime:
             now=now, pose=inp.pose, scan=inp.scan, tracker=self.tracker, skill=self.executor.status,
             search_items=search, explored_frac=self.executor.explored_frac,
             safety_reason=self._safety_reason, mission_state=self.executor.status.state.value,
-            last_event=self._last_event)
+            last_event=self._last_event, goal=self._goal)
 
     def _event(self, t: float, text: str) -> None:
         self._events.append((t, text))
@@ -181,6 +224,8 @@ class OrinRuntime:
                            "confirmed": t.confirmed} for n in self.tracker.items() for t in self.tracker.tracks(n)],
                 "events": [{"t": round(t, 2), "text": e} for t, e in self._events],
                 "safety_reason": self._safety_reason,
+                "goal": None if not self._goal else {"text": self._goal, "source": self._goal_source,
+                                                     "set_s": self._goal_set_s},
                 "map": self.mapper.stats(),
                 "stats": dict(self._stats),
             }
