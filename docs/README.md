@@ -1,6 +1,8 @@
 # Locate Bot — documentation package
 
-**Scope: Markdown only. Coding is paused. No coding subagents have been launched.**
+> **Start with [PROJECT.md](PROJECT.md).** It is the current, complete project overview. The numbered documents below were written before the Raspberry Pi + Jetson design and the code; where they disagree, PROJECT.md wins.
+
+**Status:** code now exists for the LiDAR subsystem and model setup; see PROJECT.md §4.
 
 Plan for a Jetson Orin Nano Super RC-car robot combining LiDAR obstacle constraints with asynchronous camera-based target identification, scoped for a 24-hour hackathon.
 
