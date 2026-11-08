@@ -155,16 +155,17 @@ POSTs must send `Content-Type: application/json`.
 - Tuning on the car: `VehicleConfig` (wheelbase, steering, width, speed), stop distance, camera mount offset and field of view
 - The planned SpacetimeDB dashboard (§9 of `docs/PROJECT.md`); the Orin operator page is used for now
 
-## 9. Telegram bridge (`my-spectrum-app/`)
+## 9. Chat bridge: iMessage + Telegram (`my-spectrum-app/`)
 
-A Node/TypeScript app on [Spectrum](https://photon.codes/docs/spectrum-ts) (`spectrum-ts` + `@spectrum-ts/telegram`) that turns Telegram messages into calls to the Orin operator API in §7. No robot code depends on it.
+A Node/TypeScript app on [Spectrum](https://photon.codes/docs/spectrum-ts) (`spectrum-ts`, Spectrum Cloud iMessage, `@spectrum-ts/telegram`) that turns chat messages into calls to the Orin operator API in §7. No robot code depends on it.
 
-- **Commands:** `/find a, b` (search), `/explore`, `/goto <item>`, `/follow <item>`, `/look`, `/home`, `/stop` (also plain `stop`), `/status`, `/map` (sends the map image), `/savemap <name>`, `/approve`, `/reject`. Plain text like `find my keys` also works.
-- **Notifications:** polls `/status` every 2 s; tells subscribed chats when an item is confirmed, a skill ends, a safety stop fires, the brain wants approval, or the robot is unreachable.
-- **Access:** only chats in `ALLOWED_CHAT_IDS` can command the robot. Others get a refusal that shows their chat id.
-- **Config (`.env`, git-ignored, never commit):** `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET`, `SPECTRUM_TELEGRAM_BOT_TOKEN`, `ROBOT_URL` (default `http://127.0.0.1:8090`), `ALLOWED_CHAT_IDS`. See `.env.example`.
-- **Run:** `cd my-spectrum-app && npm install && npm run start`.
-- **Status:** type-checks; not yet run end to end against the robot.
+- **Commands** (slash optional): `find a, b` (search), `explore`, `goto <item>`, `follow <item>`, `look`, `home`, `stop`, `status`, `map` (sends the map image), `savemap <name>`, `approve`, `reject`.
+- **Notifications:** polls `/status` every 2 s; tells chats that sent a command when an item is confirmed, a skill ends, a safety stop fires, the brain wants approval, or the robot is unreachable.
+- **Access:** open by default: anyone who messages the bot can use it. Set `RESTRICT_SENDERS=1` to allow only `ALLOWED_SENDERS` (phone numbers or Apple ID emails for iMessage, chat ids for Telegram).
+- **Config (`.env`, git-ignored, never commit):** `SPECTRUM_PROJECT_ID`, `SPECTRUM_PROJECT_SECRET`, `IMESSAGE_ENABLED=1`, `SPECTRUM_TELEGRAM_BOT_TOKEN` (empty = Telegram off), `ROBOT_URL` (default `http://127.0.0.1:8090`), `RESTRICT_SENDERS`, `ALLOWED_SENDERS`. See `.env.example`.
+- **iMessage** uses Photon's cloud lines (no Mac needed). On Free/Pro plans the number is from a shared pool and each user's phone number must be added as a project user in the Photon dashboard.
+- **Run:** `cd my-spectrum-app && npm install`, then `npm run telegram`, `npm run imessage`, or `npm run start` (whatever `.env` enables).
+- **Status:** type-checks and the startup checks work; not yet run end to end against the robot or a real iMessage line.
 
 **Networking.** The bridge only makes **outgoing** connections (to Photon/Telegram and to the Orin), so no ngrok, port forwarding or public server is needed. It does need internet, which the school network may block for the robot. Plan: give the Orin internet through a phone hotspot or travel router and run the bridge on the Orin. A cloud server (e.g. Vultr) only helps if the robot can already reach the internet, via an outgoing tunnel. Telegram adds seconds of lag: it is not the emergency stop.
 

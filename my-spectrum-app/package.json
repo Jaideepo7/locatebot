@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "tsx --env-file=.env src/index.ts",
+    "telegram": "tsx --env-file=.env src/index.ts telegram",
+    "imessage": "tsx --env-file=.env src/index.ts imessage",
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
