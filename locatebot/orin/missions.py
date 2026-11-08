@@ -1,14 +1,15 @@
 """Mission bridge on the Orin: Telegram/operator missions from the Pi -> skills, status back.
 
-The Pi (``locatebot/remote``) publishes ``MissionRequest`` / ``MissionCancel`` on the link; the
+A Pi-side mission sender (none in the repo yet; Telegram goes through ``my-spectrum-app/`` to
+the operator HTTP API instead) publishes ``MissionRequest`` / ``MissionCancel`` on the link; the
 Orin's subscriber hands them to ``on_request`` / ``on_cancel`` (any thread, never blocks).
 ``tick(now, ws)`` runs from the control loop (``OrinRuntime.step``) and does all the work:
 
 * **Validation** (ported from chanabyte's ``JetsonAgent``, feat/photon-dispatch): a request that
   is expired, future-dated beyond ``max_skew_s`` (5 s), has ``expires <= issued``, or arrives
   while another mission is active is answered ``FAILED`` with reason ``EXPIRED`` /
-  ``CLOCK_SKEW`` / ``INVALID_EXPIRY`` / ``BUSY`` (the Pi's ``ZmqRobotLink`` turns a first-status
-  ``FAILED`` with one of these reasons into a rejection). A duplicate id is never started twice:
+  ``CLOCK_SKEW`` / ``INVALID_EXPIRY`` / ``BUSY`` (a sender should treat a first-status ``FAILED``
+  with one of these reasons as a rejection). A duplicate id is never started twice:
   the last status for it is sent again. Mission times are Unix wall clock (``wall_clock``).
 * **Start**: ``runtime.set_goal("find <target>", source="mission")``. With an LLM brain the brain
   acts (approve or auto, as configured; a brain paused by an earlier STOP is resumed). Without
@@ -56,8 +57,7 @@ PENDING, ACCEPTED, SEARCHING, DETECTED, APPROACHING, COMPLETED, FAILED, CANCELLE
     "PENDING", "ACCEPTED", "SEARCHING", "TARGET_DETECTED", "APPROACHING", "COMPLETED", "FAILED", "CANCELLED")
 TERMINAL = frozenset({COMPLETED, FAILED, CANCELLED})
 _END = {FAILED, CANCELLED}
-# Same table as locatebot/remote/protocol.py (tested equal); duplicated so the Orin does not import
-# the Pi's remote-control package.
+# Allowed status transitions (the order a sender may see them in).
 TRANSITIONS = {
     PENDING: {ACCEPTED} | _END,
     ACCEPTED: {SEARCHING} | _END,

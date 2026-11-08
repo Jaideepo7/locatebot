@@ -92,9 +92,13 @@ def accepted(rig, target="marker"):
     return mid
 
 
-def test_transitions_match_the_pi_protocol():
-    from locatebot.remote.protocol import TRANSITIONS
-    assert {k.value: {v.value for v in vs} for k, vs in TRANSITIONS.items()} == mb.TRANSITIONS
+def test_transitions_use_link_states_and_end_in_terminal_states():
+    from locatebot.link.messages import MISSION_STATES
+    used = set(mb.TRANSITIONS) | set().union(*mb.TRANSITIONS.values())
+    assert used <= set(MISSION_STATES)
+    assert not set(mb.TRANSITIONS) & mb.TERMINAL  # nothing leaves COMPLETED / FAILED / CANCELLED
+    for old, new in mb.TRANSITIONS.items():
+        assert {"FAILED", "CANCELLED"} <= new, old  # every live state can fail or be cancelled
 
 
 def test_routine_happy_path_one_status_per_transition():
