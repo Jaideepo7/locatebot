@@ -5,7 +5,7 @@
 ## The car (measured 2026-11-08)
 - **Raspberry Pi 5** (Raspberry Pi OS, Debian 13 trixie) on a **Freenove-style 4WD board**: 4 DC motors through H-bridges fed by a **PCA9685** PWM chip (I2C `0x40`), **skid steering** (tank-style, turns on the spot), no steering servo, no wheel encoders. The board's "Load" switch cuts motor/servo power; "Power" feeds the Pi.
 - Camera OV5647 on CSI with a pan/tilt servo (PCA9685 ch 8/9). HC-SR04 ultrasonic on GPIO 27 (trigger) / 22 (echo). Buzzer GPIO 17, IR line sensors GPIO 14/15/23, ADS7830 ADC `0x48` (battery on ch 2, uncalibrated), OLED `0x3C`. Battery 3 × 18650 (11.1–12.6 V).
-- RPLIDAR C1 on the Pi (USB, `/dev/ttyUSB0`). Car front = LiDAR **2.4°**; the LiDAR sees the car's own body behind it (rear returns ~0), so the rear needs an angle mask.
+- RPLIDAR C1 on the Pi (USB, `/dev/ttyUSB0`). Car front = LiDAR **182.4°** since the 2026-11-08 remount (2.4° before; re-check after touching it); the LiDAR sees the car's own body behind it (rear returns ~0), so the rear needs an angle mask.
 - **GPIO: pigpio does not work on the Pi 5.** Use gpiozero / lgpio (the `pi` extra in `pyproject.toml` still names pigpio).
 - The real `MotorDriver` is `locatebot/pi/pca9685_motor.py` (`PCA9685SkidSteer`, below). Full pin/channel map and the prototype scripts that measured it: `prototypes/pi5_freenove/README.md` (reference only: those scripts break the package invariants).
 
