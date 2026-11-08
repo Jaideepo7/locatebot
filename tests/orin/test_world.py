@@ -67,3 +67,17 @@ def test_no_scan_means_all_unknown_and_items_capped():
     assert all(math.isnan(v) for v in ws.sector_clearance_m)
     assert len(ws.items) == 12
     assert ws.skill.call == call and ws.safety_reason == "obstacle" and ws.last_event == "blocked"
+
+
+def test_changes_become_change_views_nearest_first_without_promoted():
+    from locatebot.lidar.layers import ChangeBlob
+    blobs = [ChangeBlob(1, (3.0, 0.0), 0.4, 8, 2.0, 9.0, 20, moving=False),
+             ChangeBlob(2, (0.0, 1.0), 0.3, 5, 8.0, 9.5, 10, moving=True),
+             ChangeBlob(3, (1.0, 1.0), 0.5, 9, 0.0, 9.5, 90, promoted=True)]
+    ws = build_world_state(now=10.0, pose=Pose2D(0.0, 0.0, 0.0), scan=None, tracker=None,
+                           skill=SkillStatus(), changes=blobs, max_changes=5)
+    assert [round(c.range_m, 3) for c in ws.changes] == [1.0, 3.0]
+    near = ws.changes[0]
+    assert near.moving and math.isclose(near.bearing_rad, math.pi / 2) and math.isclose(near.age_s, 2.0)
+    assert build_world_state(now=1.0, pose=Pose2D(0, 0, 0), scan=None, tracker=None,
+                             skill=SkillStatus()).changes == ()

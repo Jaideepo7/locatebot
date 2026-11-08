@@ -427,7 +427,7 @@ function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;","
 function rows(el,pairs){el.innerHTML=pairs.map(([k,v])=>`<tr><td class="k">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
 function mapMode(m){if(m.mode!=="localizing")return "mapping (new map)";
  const st=m.lost?"LOST":m.ambiguous?"ambiguous: give a start pose":!m.initialized?"localizing...":"localized ("+m.source+")";
- return st+(m.last_score==null?"":" score "+m.last_score)}
+ return st+(m.last_score==null?"":" score "+m.last_score)+(m.changes?", "+m.changes+" new things":"")}
 function draw(){const s=window.lastStatus;if(!s||!imgReady)return;const c=$("map"),g=c.getContext("2d"),m=s.map_meta;
  c.width=m.width;c.height=m.height;g.imageSmoothingEnabled=false;g.drawImage(img,0,0);
  const px=(x,y)=>[(x-m.origin_xy[0])/m.resolution_m,m.height-(y-m.origin_xy[1])/m.resolution_m];

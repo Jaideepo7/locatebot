@@ -10,6 +10,10 @@ scan, so "home" is (0, 0, 0).
 (``lidar.localize.LocalizingMapper``): the map frame is the saved map's, ``home`` its stored home
 pose, and the map is updated slowly. ``stats()`` reports ``mode`` (``mapping``/``localizing``),
 ``lost``, ``ambiguous`` and ``last_score``.
+
+In that mode the map is layered by default (M2, ``lidar.layers.LayeredMap``): new/moving things
+go to a short-lived dynamic layer, ``change_blobs()`` lists them, and ``grid_snapshot()`` returns
+the planning grid (room + dynamic + blocking extra layers) so skills plan around them.
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import threading
 from pathlib import Path
 
 from locatebot.lidar.grid import OccupancyGrid
+from locatebot.lidar.layers import ChangeBlob, LayeredMap
 from locatebot.lidar.localize import LocalizerConfig, LocalizeResult, LocalizingMapper
 from locatebot.lidar.mapping import Mapper
 from locatebot.lidar.odometry import OdometryResult
@@ -39,12 +44,31 @@ class LiveMapper:
 
     @classmethod
     def from_saved(cls, path, guess: Pose2D | None = None, config: LocalizerConfig | None = None,
-                   slow_rate: float = 0.2, **kw) -> "LiveMapper":
+                   slow_rate: float = 0.2, layered: bool = True, **kw) -> "LiveMapper":
         """Localize in a saved ``.lbmap`` instead of starting a new map. ``guess`` is where the
         car is in that map (dock pose, operator click); None = global search over the map.
-        ``home`` = the map's stored home pose (where it was first mapped), else the guess."""
-        engine = LocalizingMapper.from_file(path, guess=guess, config=config, slow_rate=slow_rate)
+        ``home`` = the map's stored home pose (where it was first mapped), else the guess.
+        ``layered``: static/dynamic layers and change detection (M2)."""
+        engine = LocalizingMapper.from_file(path, guess=guess, config=config, slow_rate=slow_rate,
+                                            layered=layered)
         return cls(engine=engine, **kw)
+
+    @property
+    def layers(self) -> LayeredMap | None:
+        """The layered map (localizing + layered mode) or None. Mutate only under ``locked()``."""
+        return getattr(self._mapper, "layers", None)
+
+    def locked(self) -> threading.Lock:
+        """The mapper lock, for modules that update an extra layer (``with lm.locked(): ...``)."""
+        return self._lock
+
+    def change_blobs(self, min_persistence: int = 3) -> list[ChangeBlob]:
+        """Current new/moving things vs the saved room map, seen in >= ``min_persistence`` scans
+        (one-scan flickers are hidden: on the real C1 replays they were mixed-pixel edges).
+        Empty when not layered."""
+        with self._lock:
+            lay = getattr(self._mapper, "layers", None)
+            return lay.blobs(min_persistence=min_persistence) if lay is not None else []
 
     @property
     def localizing(self) -> bool:
@@ -94,8 +118,12 @@ class LiveMapper:
             return self._scans.nearest(stamp_s)
 
     def grid_snapshot(self) -> OccupancyGrid:
-        """Independent copy of the grid, safe to plan on while mapping continues."""
+        """Independent copy of the grid, safe to plan on while mapping continues. In layered
+        mode: the planning grid (room + dynamic things + blocking extra layers)."""
         with self._lock:
+            lay = getattr(self._mapper, "layers", None)
+            if lay is not None:
+                return lay.planning_grid()
             g = copy.copy(self._mapper.grid)
             g.log_odds = self._mapper.grid.log_odds.copy()
             return g
@@ -113,7 +141,9 @@ class LiveMapper:
                 out.update({"initialized": loc.initialized, "lost": loc.lost,
                             "ambiguous": loc.ambiguous and not loc.initialized,
                             "source": None if r is None else r.source,
-                            "lost_events": loc.n_lost_events, "recoveries": loc.n_recoveries})
+                            "lost_events": loc.n_lost_events, "recoveries": loc.n_recoveries,
+                            "layered": m.layers is not None,
+                            "changes": len(m.layers.blobs(min_persistence=3)) if m.layers is not None else 0})
             return out
 
     def save(self, stem: str | Path, meta: dict | None = None) -> dict[str, Path]:

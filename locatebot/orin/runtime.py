@@ -159,7 +159,7 @@ class OrinRuntime:
             now=now, pose=inp.pose, scan=inp.scan, tracker=self.tracker, skill=self.executor.status,
             search_items=search, explored_frac=self.executor.explored_frac,
             safety_reason=self._safety_reason, mission_state=self.executor.status.state.value,
-            last_event=self._last_event)
+            last_event=self._last_event, changes=self.mapper.change_blobs())
 
     def _event(self, t: float, text: str) -> None:
         self._events.append((t, text))

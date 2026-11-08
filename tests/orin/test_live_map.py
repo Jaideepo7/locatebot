@@ -156,3 +156,31 @@ def test_from_saved_concurrent_readers_and_relocalize(tmp_path):
     assert st["scans"] == 20 and st["mode"] == "localizing"
     est, t_last = lm.pose, _in_map_frame(start, poses[-1])
     assert math.hypot(est.x - t_last.x, est.y - t_last.y) < 0.1
+
+
+def test_layered_saved_map_reports_new_box_to_world_state_and_planning(tmp_path):
+    from locatebot.lidar.grid import OCCUPIED
+    from locatebot.mission.types import VehicleConfig
+    from locatebot.orin.runtime import OrinRuntime
+    from locatebot.orin.skills import SkillExecutor
+    path, start = _saved_map(tmp_path)
+    truth = demo_trajectory(60)[20]
+    lm = LiveMapper.from_saved(path, guess=_in_map_frame(start, truth))
+    assert lm.layers is not None and lm.stats()["layered"]
+    room = demo_room().with_box(4.6, 2.3, 5.0, 2.7)  # not in the saved map
+    rt = OrinRuntime(lm, SkillExecutor(VehicleConfig()))
+    rng = np.random.default_rng(12)
+    static0 = None
+    for i in range(8):
+        rt.on_scan(simulate_scan(room, truth, rng=rng, stamp_s=20.0 + 0.1 * i, seq=i))
+        if i == 0:
+            static0 = (lm.layers.static.classify() == OCCUPIED).sum()
+    blobs = lm.change_blobs()
+    assert len(blobs) == 1 and lm.stats()["changes"] == 1
+    ws = rt.world_state(now=21.0)
+    assert len(ws.changes) == 1 and 0.1 < ws.changes[0].width_m < 0.7
+    plan = lm.grid_snapshot()
+    assert (plan.classify() == OCCUPIED).sum() > (lm.layers.static.classify() == OCCUPIED).sum()
+    assert abs(int((lm.layers.static.classify() == OCCUPIED).sum()) - int(static0)) < 40
+    flat = LiveMapper.from_saved(path, guess=_in_map_frame(start, truth), layered=False)
+    assert flat.layers is None and flat.change_blobs() == []

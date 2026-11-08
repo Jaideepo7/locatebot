@@ -101,3 +101,20 @@ def test_deterministic_bounded_and_single_line_fields():
     assert len(a) < 2500
     assert all(len(l) < 300 for l in a.splitlines())
     assert "last event: a b" in a
+
+
+def test_changes_line_bounded_and_absent_when_empty():
+    import dataclasses
+
+    from locatebot.mission.types import ChangeView
+    base = ws()
+    assert not any(l.startswith("changes:") for l in render_world_state(base).splitlines())
+    ch = (ChangeView(1.0, 2.0, 0.4, 1.2, 0.0, True, 3.0), ChangeView(2.0, 2.0, 0.3, 2.0, math.radians(40), False, 9.0))
+    lines = render_world_state(dataclasses.replace(base, changes=ch)).splitlines()
+    line = [l for l in lines if l.startswith("changes:")][0]
+    assert line == "changes: 2 new things: 0.4 m wide at 1.2 m ahead (moving), 0.3 m wide at 2.0 m 40° left"
+    assert lines[-1].startswith("last event:")
+    many = tuple(ChangeView(0, 0, 0.2, 1.0 + k, 0.0, False, 1.0) for k in range(9))
+    line = [l for l in render_world_state(dataclasses.replace(base, changes=many)).splitlines()
+            if l.startswith("changes:")][0]
+    assert line.startswith("changes: 9 new things: ") and line.endswith("(+6 more)") and len(line) < 200
