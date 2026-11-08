@@ -22,6 +22,8 @@ Tools (GET, JSON unless noted)
   /photo/<file>                            one photo (JPEG)
   /beep?ms=150
   /scan                                    newest raw LiDAR scan for the dashboard (deg CCW, 0 = front, metres)
+  /vision                                  live detection overlay: boxes (0..1) still valid for the current view
+  POST /detections {"label","boxes":[[x0,y0,x1,y1]|{"b":[..],"label":".."}],"w","h","kind":"snap"|"look","pan_deg"}
 Command listening
   POST /ask      {"q": "..."} or form q=   queue a question
   /inbox?status=pending                    questions (pending | working | answered | all)
@@ -58,6 +60,18 @@ class Bot:
         self.car.pwm.set_pulse_us(8, 1500); self.car.pwm.set_pulse_us(9, 1500)
         threading.Thread(target=lidar_thread, args=(st, cal.get("lidar_front_deg", 0.0)), daemon=True).start()
         self.tasks = [loop.create_task(sonar_task(st)), loop.create_task(control_task(st, self.car, False))]
+        # live detection overlay: remember where the camera points and when the wheels last moved, so a box from
+        # the Orin is only drawn on the live video while it still matches what the camera sees
+        st.pan_us, st.moved_t = 1500, 0.0
+        _set = self.car.pwm.set_pulse_us
+        def _tracked(ch, us, _set=_set):
+            if ch == 8:
+                st.pan_us = int(us)
+            return _set(ch, us)
+        self.car.pwm.set_pulse_us = _tracked
+        self.last_snap = (0.0, 1500)            # (capture time, pan_us) of the newest /snap
+        self.det = None                         # newest detections posted by the planner
+        self.tasks.append(loop.create_task(self._motion_watch()))
         self.adc = ADS7830(self.car.bus)
         self.mission = None; self.mission_name = None; self.mission_t0 = None
         self.last_result = None
@@ -332,6 +346,44 @@ class Bot:
                 "front_deg_setting": front}
 
     # ---------- state ----------
+    async def _motion_watch(self):
+        st = self.st
+        while True:
+            now = time.time()
+            man = getattr(st, "manual", None)
+            if abs(st.cmd) > 0.02 or (man and man != (0, 0) and now < getattr(st, "manual_until", 0)):
+                st.moved_t = now
+            await asyncio.sleep(0.05)
+
+    def post_detections(self, data):
+        """Boxes from the Orin for the live overlay. kind "snap": they belong to the newest /snap photo;
+        kind "look": a look_around photo taken at pan_deg while the car stood still."""
+        w, h = float(data.get("w") or 960), float(data.get("h") or 540)
+        boxes = []
+        for bx in (data.get("boxes") or [])[:8]:
+            b, lab = (bx.get("b"), bx.get("label")) if isinstance(bx, dict) else (bx, None)
+            x0, y0, x1, y1 = [float(v) for v in b]
+            boxes.append({"b": [round(max(0, x0 / w), 4), round(max(0, y0 / h), 4), round(min(1, x1 / w), 4),
+                                round(min(1, y1 / h), 4)], "label": str(lab or data.get("label") or "")[:40]})
+        now = time.time()
+        if data.get("kind") == "look":
+            cap_t, pan_us = now, int(1500 - float(data.get("pan_deg", 0)) * 14.3)
+        else:
+            cap_t, pan_us = self.last_snap
+        self.det = {"label": str(data.get("label") or "")[:40], "boxes": boxes, "cap_t": cap_t, "pan_us": pan_us,
+                    "post_t": now}
+        return {"ok": True, "n": len(boxes)}
+
+    def vision(self):
+        d, st, now = self.det, self.st, time.time()
+        if not d:
+            return {"show": False, "boxes": []}
+        same_view = abs(st.pan_us - d["pan_us"]) < 8 and st.moved_t <= d["cap_t"]
+        fresh = now - d["post_t"] < 1.4 and abs(st.pan_us - d["pan_us"]) < 8   # taken on the move: show briefly
+        show = bool(d["boxes"]) and (same_view and now - d["cap_t"] < 20 or fresh)
+        return {"show": show, "label": d["label"], "boxes": d["boxes"] if show else [],
+                "age_s": round(now - d["cap_t"], 1), "moving_since": not same_view}
+
     def state(self):
         st = self.st
         r = lambda v: None if v is None else round(v, 1)
@@ -626,6 +678,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self._call(self._wait(5), timeout=8))
             if p == "/scan":                       # newest raw LiDAR scan for the dashboard radar, in the
                 return self._send(200, b.scan_json())  # PACKAGE frame: degrees CCW (+ = left), 0 = car front, metres
+            if p == "/vision":                     # live detection overlay for the app (boxes 0..1 of the frame)
+                return self._send(200, b.vision())
             if p == "/bins":                       # every 10-deg LiDAR slice (car frame, + = right): nearest cm
                 bins = getattr(b.st, "bins", {}) or {}
                 return self._send(200, {"front_deg_setting": b.car.cal.get("lidar_front_deg"),
@@ -661,13 +715,14 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/wait":
                 return self._send(200, self._call(self._wait(min(f("seconds", 30), 200)), timeout=210))
             if p == "/snap" and q.get("fast") == "1":       # no servo move, no settle wait (while driving)
-                return self._send(200, b.st.cam.capture_bytes(), "image/jpeg")
+                t_cap = time.time(); jpg = b.st.cam.capture_bytes(); b.last_snap = (t_cap, b.st.pan_us)
+                return self._send(200, jpg, "image/jpeg")
             if p == "/snap":
                 pan_deg = f("pan", 0); tilt = int(f("tilt", 1500))
                 b.car.pwm.set_pulse_us(8, max(1000, min(2000, int(1500 - pan_deg * 14.3))))
                 b.car.pwm.set_pulse_us(9, max(1000, min(2000, tilt)))
                 time.sleep(0.6)
-                jpg = b.st.cam.capture_bytes()
+                t_cap = time.time(); jpg = b.st.cam.capture_bytes(); b.last_snap = (t_cap, b.st.pan_us)
                 return self._send(200, jpg, "image/jpeg")
             if p == "/photos":
                 return self._send(200, b.photos(int(f("since", 0))))
@@ -723,6 +778,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, b.ask(data.get("q", "")))
         if p == "/claim":
             return self._send(200, b.set_q(data.get("id", 0), status="working"))
+        if p == "/detections":                     # boxes from the Orin -> drawn on the live video
+            return self._send(200, b.post_detections(data))
         if p == "/progress":                       # live progress line on a question (shown in the app)
             with b.qa_lock:
                 for item in b.qa:

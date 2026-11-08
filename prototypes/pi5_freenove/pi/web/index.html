@@ -18,7 +18,7 @@
 :root{
   --night:#170d2e; --night-deep:#0d0720; --dusk:#2a1b52; --dusk-hi:#3a2872; --line:#4d3a8c;
   --gold:#f0bf4f; --ember:#a5512a; --firefly:#62e6c3; --parchment:#f2e2b6; --ink:#3a2414;
-  --alarm:#ff4d5e; --alarm-dk:#8c1f33; --text:#efe8ff; --mute:#b4a8dc;
+  --alarm:#ff4d5e; --alarm-dk:#8c1f33; --text:#efe8ff; --mute:#b4a8dc; --seek:#ff4fd8;
   --px:4px;
 }
 *{box-sizing:border-box}
@@ -56,6 +56,15 @@ h1{margin:0;font-size:34px;font-weight:700;line-height:1;color:var(--gold);lette
 .screen img{display:block;width:100%;height:100%;object-fit:cover}
 .screen::before,.screen::after{content:"";position:absolute;width:12px;height:12px;background:var(--gold);z-index:2;top:0}
 .screen::before{left:0;box-shadow:4px 4px 0 0 var(--ember)} .screen::after{right:0;box-shadow:-4px 4px 0 0 var(--ember)}
+/* what the Orin sees: detection boxes drawn over the live video */
+.vision{position:absolute;inset:0;z-index:1;pointer-events:none;transition:opacity .3s steps(3)}
+.vision.off{opacity:0}
+.det{position:absolute;border:3px solid var(--seek);box-shadow:0 0 0 1px rgba(13,7,32,.6)}
+.det i{position:absolute;width:9px;height:9px;background:var(--seek)}
+.det i:nth-child(1){left:-6px;top:-6px}.det i:nth-child(2){right:-6px;top:-6px}
+.det i:nth-child(3){left:-6px;bottom:-6px}.det i:nth-child(4){right:-6px;bottom:-6px}
+.det b{position:absolute;left:-3px;bottom:100%;margin-bottom:3px;background:var(--seek);color:var(--night-deep);font-size:14px;font-weight:700;padding:1px 7px;white-space:nowrap}
+.det.low b{bottom:auto;top:100%;margin:6px 0 0}
 .hud{position:absolute;left:10px;right:10px;bottom:10px;display:flex;justify-content:space-between;gap:8px;z-index:2}
 .hud span{background:rgba(13,7,32,.78);padding:2px 8px;font-size:14px}
 .cam-off{position:absolute;inset:0;display:none;place-items:center;text-align:center;padding:20px;color:var(--mute);background:var(--night-deep)}
@@ -157,6 +166,7 @@ dialog::backdrop{background:rgba(13,7,32,.85)}
     <section aria-label="Robot camera and controls">
       <div class="screen px">
         <img id="cam" alt="Live view from the robot's camera" src="/stream">
+        <div id="vision" class="vision off" aria-live="polite"></div>
         <div class="hud"><span id="hud-mode">Idle</span><span id="hud-front">Front –</span></div>
         <div id="cam-off" class="cam-off">No picture. The robot may be off or out of Wi-Fi range. Retrying…</div>
       </div>
@@ -370,6 +380,23 @@ $("#beep").onclick = () => api("/beep?ms=150").catch(() => {});
 const cam = $("#cam");
 cam.onerror = () => { $("#cam-off").classList.add("on"); setTimeout(() => { cam.src = "/stream?t=" + Date.now(); }, 2000); };
 cam.onload = () => $("#cam-off").classList.remove("on");
+
+/* ---------- what the Orin sees (boxes stay only while they still match the camera view) ---------- */
+let lastVision = "";
+async function pollVision() {
+  let v;
+  try { v = await api("/vision"); } catch (e) { return; }
+  const el = $("#vision");
+  if (!v.show) { el.classList.add("off"); return; }
+  const html = v.boxes.map(d => {
+    const [x0, y0, x1, y1] = d.b;
+    return `<div class="det${y0 < 0.09 ? " low" : ""}" style="left:${x0 * 100}%;top:${y0 * 100}%;width:${(x1 - x0) * 100}%;height:${(y1 - y0) * 100}%"><i></i><i></i><i></i><i></i><b>${esc(d.label)}</b></div>`;
+  }).join("");
+  if (html !== lastVision) { el.innerHTML = html; lastVision = html; }
+  el.setAttribute("aria-label", "The vision model sees: " + v.boxes.map(d => d.label).join(", "));
+  el.classList.remove("off");
+}
+setInterval(pollVision, 500); pollVision();
 
 /* ---------- ask + quest log ---------- */
 async function ask(q) {
