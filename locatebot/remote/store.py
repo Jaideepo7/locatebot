@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending', last_error TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox (status, next_attempt_at);
+CREATE TABLE IF NOT EXISTS cursors (name TEXT PRIMARY KEY, seq INTEGER NOT NULL, updated_at REAL NOT NULL);
 """
 
 
@@ -131,6 +132,15 @@ class Store:
 
     def has_event(self, event_id: str) -> bool:
         return self._q("SELECT 1 FROM events WHERE event_id = ?", (event_id,)).fetchone() is not None
+
+    # --- delivery cursors (Photon WebSocket replay position, saved after processing) ------------
+    def get_cursor(self, name: str) -> int:
+        row = self._q("SELECT seq FROM cursors WHERE name = ?", (name,)).fetchone()
+        return int(row[0]) if row else 0
+
+    def set_cursor(self, name: str, seq: int, now: float) -> None:
+        self._q("INSERT INTO cursors VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET seq = excluded.seq, "
+                "updated_at = excluded.updated_at", (name, int(seq), now))
 
     # --- missions -----------------------------------------------------------------------------
     @staticmethod
@@ -201,6 +211,9 @@ class Store:
 
     def list_outbox(self) -> List[OutboxItem]:
         return [self._item(r) for r in self._q("SELECT * FROM outbox ORDER BY id").fetchall()]
+
+    def count_outbox(self, status: str = "pending") -> int:
+        return self._q("SELECT COUNT(*) FROM outbox WHERE status = ?", (status,)).fetchone()[0]
 
     def mark_outbox(self, item_id: int, status: str, attempts: int, next_attempt_at: float, error: str = "") -> None:
         self._q("UPDATE outbox SET status = ?, attempts = ?, next_attempt_at = ?, last_error = ? WHERE id = ?",

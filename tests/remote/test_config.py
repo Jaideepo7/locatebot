@@ -18,19 +18,39 @@ GOOD = {
 def test_valid_env():
     s = Settings.from_env(GOOD)
     assert s.photon_mode == "live" and s.mission_ttl_s == 600
-    assert s.webhook_enabled and s.operator_enabled and s.robot_id == "locatebot"
+    assert s.operator_enabled and s.robot_id == "locatebot"
+    assert s.photon_api_origin == "https://api.photon.codes" and s.photon_api_version == ""
 
 
-def test_console_mode_does_not_need_photon_api_key():
-    env = dict(GOOD, PHOTON_MODE="console")
+def test_console_webhook_mode_does_not_need_photon_api_key():
+    env = dict(GOOD, PHOTON_MODE="console", PHOTON_INBOUND="webhook")
     del env["PHOTON_API_KEY"]
     assert Settings.from_env(env).photon_mode == "console"
+
+
+def test_websocket_is_the_default_inbound_and_needs_the_api_key():
+    s = Settings.from_env(GOOD)
+    assert s.photon_inbound == "websocket" and not s.webhook_enabled
+    env = dict(GOOD, PHOTON_MODE="console")
+    del env["PHOTON_API_KEY"]
+    with pytest.raises(ConfigError) as e:
+        Settings.from_env(env)
+    assert "PHOTON_API_KEY" in str(e.value)
+
+
+def test_webhook_mode_needs_the_secret():
+    env = dict(GOOD, PHOTON_INBOUND="webhook")
+    assert Settings.from_env(env).webhook_enabled
+    del env["PHOTON_WEBHOOK_SECRET"]
+    with pytest.raises(ConfigError) as e:
+        Settings.from_env(env)
+    assert "PHOTON_WEBHOOK_SECRET" in str(e.value)
 
 
 def test_webhook_secret_and_operator_token_are_optional():
     env = {"PHOTON_API_KEY": GOOD["PHOTON_API_KEY"], "PHOTON_PROJECT_ID": GOOD["PHOTON_PROJECT_ID"]}
     s = Settings.from_env(env)
-    assert not s.webhook_enabled and not s.operator_enabled
+    assert s.photon_inbound == "websocket" and not s.operator_enabled
 
 
 def test_jetson_and_public_url_settings_are_no_longer_needed():
@@ -41,6 +61,8 @@ def test_jetson_and_public_url_settings_are_no_longer_needed():
 @pytest.mark.parametrize("key,value", [("PHOTON_API_KEY", "sk_live_x"), ("PHOTON_PROJECT_ID", "123"),
                                        ("PHOTON_WEBHOOK_SECRET", "secret"), ("OPERATOR_API_TOKEN", "short"),
                                        ("ROBOT_ID", "bad id!"), ("PHOTON_MODE", "carrier-pigeon"),
+                                       ("PHOTON_INBOUND", "carrier-pigeon"), ("PHOTON_API_VERSION", "latest"),
+                                       ("PHOTON_API_ORIGIN", "http://api.photon.codes"),
                                        ("MISSION_TTL_S", "-1")])
 def test_bad_values_refused(key, value):
     with pytest.raises(ConfigError) as e:

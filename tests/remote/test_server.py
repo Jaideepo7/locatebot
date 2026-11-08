@@ -38,7 +38,7 @@ class Recorder:
 
 def settings(tmp_path, **extra):
     env = {"PHOTON_MODE": "console", "PHOTON_PROJECT_ID": FIXTURE["data"]["projectId"],
-           "PHOTON_WEBHOOK_SECRET": SECRET, "OPERATOR_API_TOKEN": OTOKEN,
+           "PHOTON_WEBHOOK_SECRET": SECRET, "OPERATOR_API_TOKEN": OTOKEN, "PHOTON_INBOUND": "webhook",
            "DISPATCH_DB_PATH": str(tmp_path / "t.db")}
     env.update(extra)
     return Settings.from_env({k: v for k, v in env.items() if v is not None})
@@ -91,7 +91,8 @@ def rig(tmp_path):
 
 
 def test_healthz(rig):
-    assert rig.req("GET", "/healthz") == (200, {"ok": True, "robot_connected": True})
+    assert rig.req("GET", "/healthz") == (200, {"ok": True, "robot_connected": True, "inbound": "webhook",
+                                               "photon_connected": None, "replies_pending": 0})
 
 
 def test_webhook_signature_enforced(rig):
@@ -136,10 +137,12 @@ def test_full_flow_through_routes_and_background_thread(tmp_path):
         r.close()
 
 
-def test_webhook_disabled_without_secret(tmp_path):
-    r = Rig(tmp_path, PHOTON_WEBHOOK_SECRET=None)
-    try:
+def test_webhook_route_disabled_in_websocket_mode(tmp_path):
+    r = Rig(tmp_path, PHOTON_INBOUND="websocket", PHOTON_API_KEY="pho_sk_" + "a" * 40)
+    try:  # never started: no connection to Photon is attempted
         assert r.webhook("/start") == 404
+        health = r.req("GET", "/healthz")[1]
+        assert health["inbound"] == "websocket" and health["photon_connected"] is False
     finally:
         r.close()
 

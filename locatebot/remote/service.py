@@ -1,8 +1,13 @@
 """`RemoteService`: everything the Pi runs for Telegram remote control, minus the HTTP server.
 
 Wires the SQLite store, the messaging provider (Photon, or the console), `MissionService`, the
-reply `OutboxSender`, the optional webhook handler and a `RobotLink`, plus one background thread
-that runs `MissionService.tick()` (timeouts) and `OutboxSender.run_once()` (replies) every 0.5 s.
+reply `OutboxSender`, the inbound mode (`PhotonWebSocketInbound` or the webhook handler) and a
+`RobotLink`, plus one background thread that runs `MissionService.tick()` (timeouts) and
+`OutboxSender.run_once()` (replies) every 0.5 s.
+
+Offline (no internet / Photon down): the robot link is independent of Photon, inbound reconnects
+quietly with backoff, and replies stay in the durable SQLite outbox; `OutboxSender` retries them
+with backoff up to `OUTBOX_MAX_ATTEMPTS` (~30 min of outage) before giving up on a reply.
 Replaces the FastAPI app factory of `feat/photon-dispatch` (`backend/app.py`).
 """
 from __future__ import annotations
@@ -18,6 +23,7 @@ from .messaging import ConsoleProvider, MessagingProvider
 from .missions import MissionService
 from .notifier import OutboxSender
 from .photon import PhotonClient, PhotonWebhookHandler, WebhookVerifier
+from .photon_ws import PhotonWebSocketInbound
 from .protocol import format_ts
 from .robot import FakeRobotLink, RobotLink
 from .store import Mission, Store
@@ -25,6 +31,7 @@ from .store import Mission, Store
 log = logging.getLogger(__name__)
 
 TICK_S = 0.5
+OUTBOX_MAX_ATTEMPTS = 12  # backoff 2, 4, ... 256, then 300 s: about 30 min before a reply is dropped
 
 
 def mission_json(m: Mission) -> dict:
@@ -37,7 +44,7 @@ def mission_json(m: Mission) -> dict:
 class RemoteService:
     def __init__(self, settings: Settings, *, provider: Optional[MessagingProvider] = None,
                  link: Optional[RobotLink] = None, clock: Callable[[], float] = time.time,
-                 tick_s: float = TICK_S):
+                 tick_s: float = TICK_S, inbound: Optional[PhotonWebSocketInbound] = None):
         self.settings = settings
         self.clock = clock
         self.store = Store(settings.db_path)
@@ -50,9 +57,14 @@ class RemoteService:
             provider = ConsoleProvider() if settings.photon_mode == "console" else \
                 PhotonClient(settings.photon_api_key, settings.photon_project_id)
         self.provider = provider
-        self.outbox = OutboxSender(self.store, provider, clock=clock)
+        self.outbox = OutboxSender(self.store, provider, clock=clock, max_attempts=OUTBOX_MAX_ATTEMPTS)
         self.webhook: Optional[PhotonWebhookHandler] = None
-        if settings.webhook_enabled:
+        self.inbound: Optional[PhotonWebSocketInbound] = None
+        if settings.photon_inbound == "websocket":
+            self.inbound = inbound if inbound is not None else PhotonWebSocketInbound(
+                settings.photon_api_key, settings.photon_project_id, self.missions.handle_inbound, self.store,
+                origin=settings.photon_api_origin, api_version=settings.photon_api_version or None, clock=clock)
+        elif settings.webhook_enabled:
             self.webhook = PhotonWebhookHandler(WebhookVerifier(settings.photon_webhook_secret, clock=clock),
                                                 settings.photon_project_id, self.missions.handle_inbound)
         self._tick_s = tick_s
@@ -84,8 +96,12 @@ class RemoteService:
 
         self._thread = threading.Thread(target=loop, name="remote-background", daemon=True)
         self._thread.start()
+        if self.inbound is not None:
+            self.inbound.start()
 
     def stop(self) -> None:
+        if self.inbound is not None:
+            self.inbound.stop()
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
@@ -95,4 +111,16 @@ class RemoteService:
             stop()
 
     def health(self) -> dict:
-        return {"ok": True, "robot_connected": bool(self.link.connected)}
+        """`photon_connected` is the WebSocket subscription state; None in webhook mode (Photon
+        pushes to us, so there is nothing to observe until a delivery arrives)."""
+        h = {"ok": True, "robot_connected": bool(self.link.connected), "inbound": self.settings.photon_inbound,
+             "photon_connected": None, "replies_pending": None}
+        if self.inbound is not None:
+            st = self.inbound.status()
+            h["photon_connected"] = st["connected"]
+            h["photon_last_error"] = st["last_error"]
+        try:
+            h["replies_pending"] = self.store.count_outbox("pending")
+        except Exception:
+            h["ok"] = False
+        return h

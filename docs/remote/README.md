@@ -1,13 +1,13 @@
 # Remote control over Photon/Telegram (`locatebot/remote/`, runs on the Pi)
 
-**Status:** R1 (messaging core) built and tested in software only: SQLite in a temp dir, a scripted `FakeRobotLink` instead of the Orin, a recording provider instead of Photon, stdlib HTTP on 127.0.0.1. **Nothing here has talked to a real Photon project, Telegram, or the Orin.** No FastAPI, uvicorn, httpx or websockets needed.
+**Status:** R1 (messaging core) and R2 (Photon WebSocket inbound + `tools/remote_run.py`) built and tested in software only: SQLite in a temp dir, a scripted `FakeRobotLink` instead of the Orin, a recording provider instead of Photon, a fake Photon Socket.IO server and stdlib HTTP on 127.0.0.1. **Nothing here has talked to a real Photon project, Telegram, the Pi or the Orin.** No FastAPI, uvicorn or httpx; `websockets` (the `remote` extra) is needed only for WebSocket inbound and imported lazily.
 
 **Credit:** the messaging half is chanabyte's work on `feat/photon-dispatch` (commits `97dd665`, `5941277`, `137536a`), moved here and adapted per the review in `docs/ROADMAP.md` section R.
 
 A customer sends `/find blue toolbox` to the Telegram bot. Photon delivers the event to the Pi; `MissionService` creates a mission and sends it to the robot through a `RobotLink`; the robot acknowledges and reports progress; each report becomes a queued Telegram reply that `OutboxSender` sends through Photon.
 
 ```text
-Telegram ─► Photon ─(webhook today; WebSocket in R2)─► MissionService ─► RobotLink ─► robot (FakeRobotLink; Orin via ZeroMQ in R3)
+Telegram ─► Photon ─(Socket.IO over WebSocket, Pi dials out; or webhook)─► MissionService ─► RobotLink ─► robot (FakeRobotLink; Orin via ZeroMQ in R3)
 Telegram ◄─ Photon ◄─POST /v1/projects/{id}/messages─ OutboxSender ◄─ SQLite outbox ◄─ MissionService ◄─ MISSION_ACK / MISSION_STATUS
 ```
 
@@ -18,14 +18,15 @@ Nothing here can move the car. The only frames sent to the robot are `MISSION_RE
 |---|---|---|
 | `protocol.py` | `dispatch/protocol.py` | Frames `MISSION_REQUEST`, `MISSION_CANCEL`, `MISSION_ACK`, `MISSION_STATUS`, `ERROR`; `MissionState` (8 states) and `TRANSITIONS`; `normalize_description` (letters, digits, `- ' . , & / # ( ) +`, ≤ 120 chars); strict validation (unknown fields rejected, 4 KB cap) |
 | `messaging.py` | `backend/messaging/base.py` | Provider-neutral `Conversation`, `InboundMessage`, `SendResult`, `MessagingProvider`, `ConsoleProvider` |
+| `photon_ws.py` | new (R2) | `PhotonWebSocketInbound`: Photon's WebSocket delivery (Socket.IO subset over `websockets`), cursor + dedupe, heartbeats, backoff |
 | `photon.py` | `backend/messaging/photon.py` | Standard Webhooks verification (`WebhookVerifier`, `sign_payload`), `parse_event` for `message.received` from `telegram.photon`, `PhotonWebhookHandler` (204/400/503 policy), `PhotonClient.send_text` (urllib) |
 | `commands.py` | `backend/commands.py` | `/start`, `/find <text>`, `/status`, `/cancel`, `/help` (also `/find@Bot`) |
 | `notifier.py` | `backend/notifier.py` | Customer texts; `OutboxSender` (retries, exponential backoff, `Retry-After`) |
-| `store.py` | `backend/store.py` | SQLite: event ids, missions and the reply outbox, written in one transaction |
+| `store.py` | `backend/store.py` | SQLite: event ids, missions and the reply outbox, written in one transaction; plus the Photon WebSocket cursor |
 | `missions.py` | `backend/missions.py` | `MissionService`: missions, ownership, dedupe, rate limit, timeouts, state changes |
 | `config.py` | `backend/config.py` | `Settings.from_env`; secrets never in errors or `repr` |
 | `robot.py` | new (from `dispatch/sink.py` + `dispatch/agent.py` rules) | `RobotLink` protocol + `FakeRobotLink` (scripted robot for tests/demos) |
-| `service.py` | replaces `backend/app.py` | `RemoteService`: store + provider + `MissionService` + `OutboxSender` + webhook handler + link + one background thread |
+| `service.py` | replaces `backend/app.py` | `RemoteService`: store + provider + `MissionService` + `OutboxSender` + inbound (WebSocket or webhook) + link + one background thread |
 | `server.py` | replaces `backend/app.py` | stdlib `ThreadingHTTPServer`: the routes below |
 
 Dropped: the FastAPI app, `backend/robot_link.py` (WebSocket device authentication; the Pi talks to the Orin over our private Ethernet link), `dispatch/ws_client.py`, `tools/fake_jetson.py` (use `FakeRobotLink`), the `backend`/`robot-link` extras. `dispatch/agent.py` (`JetsonAgent`) is not copied: its validation rules live on in `FakeRobotLink` and move to the Orin in R3 (`locatebot/orin/missions.py`).
@@ -42,9 +43,12 @@ Dropped: the FastAPI app, `backend/robot_link.py` (WebSocket device authenticati
 ## Configuration (environment, or `.env` which is git-ignored; see `.env.example`)
 | Variable | Required | Meaning |
 |---|---|---|
-| `PHOTON_API_KEY` | in `live` mode | Project API key `pho_sk_...` |
+| `PHOTON_API_KEY` | in `live` mode and for WebSocket inbound | Project API key `pho_sk_...` (`project:read` to receive, plus send rights for replies) |
 | `PHOTON_PROJECT_ID` | yes | `pho_prj_...` (events for other projects are ignored) |
-| `PHOTON_WEBHOOK_SECRET` | no | `whsec_...`; enables `POST /api/photon/webhook` |
+| `PHOTON_INBOUND` | no | `websocket` (default) or `webhook` |
+| `PHOTON_WEBHOOK_SECRET` | in webhook mode | `whsec_...`; enables `POST /api/photon/webhook` |
+| `PHOTON_API_VERSION` | no | pin the event payload version (date, e.g. `2026-07-01`); default: Photon's |
+| `PHOTON_API_ORIGIN` | no | default `https://api.photon.codes` |
 | `OPERATOR_API_TOKEN` | no | ≥ 32 chars; enables `/api/missions*` |
 | `PHOTON_MODE` | no | `live` (default) or `console` (print replies) |
 | `ROBOT_ID` | no | default `locatebot` |
@@ -54,8 +58,8 @@ Dropped: the FastAPI app, `backend/robot_link.py` (WebSocket device authenticati
 ## Routes (`server.py`, default bind 127.0.0.1:8070)
 | Route | Auth | Result |
 |---|---|---|
-| `GET /healthz` | none | `{"ok": true, "robot_connected": bool}` |
-| `POST /api/photon/webhook` | Standard Webhooks signature | 204 OK, duplicate or ignored; 400 bad signature; 503 storage down (Photon retries); 413 > 256 KB; 404 when no secret is set |
+| `GET /healthz` | none | `{"ok", "robot_connected", "inbound", "photon_connected" (null in webhook mode), "photon_last_error", "replies_pending"}` |
+| `POST /api/photon/webhook` | Standard Webhooks signature | 204 OK, duplicate or ignored; 400 bad signature; 503 storage down (Photon retries); 413 > 256 KB; 404 unless `PHOTON_INBOUND=webhook` |
 | `POST /api/missions` `{"target_description"}` + optional `Idempotency-Key` | `Bearer OPERATOR_API_TOKEN` | 201 created; 200 replay; 409 busy; 422 invalid; 503 robot offline |
 | `GET /api/missions/{id}` | operator | 200 / 404 / 422 |
 | `POST /api/missions/{id}/cancel` | operator | 202 cancel *requested* (the robot confirms `CANCELLED`); 404 / 409 |
@@ -71,13 +75,56 @@ Operator routes answer 401 (`WWW-Authenticate: Bearer`) for a wrong token (const
 - **Customers only touch their own missions.** `/status` and `/cancel` match on the Photon space plus sender.
 - **Rate limit:** 5 `/find` per conversation per minute.
 
+## Photon WebSocket inbound (`photon_ws.py`, R2)
+Photon's docs (Beta, read 2026-11-08: [WebSocket](https://docs.photon.codes/docs/beta/message-delivery/websocket.md), [session](https://docs.photon.codes/docs/beta/websocket/session.md), [events](https://docs.photon.codes/docs/beta/websocket/events.md), [cursors](https://docs.photon.codes/docs/beta/websocket/cursors.md), [errors](https://docs.photon.codes/docs/beta/websocket/errors.md), [AsyncAPI](https://api.photon.codes/asyncapi.yaml)) say: *"Photon uses **Socket.IO**, not a raw WebSocket protocol."* We have no Socket.IO client dependency, so `photon_ws.py` implements the subset this endpoint uses over `websockets`:
+
+| Step | On the wire |
+|---|---|
+| Connect | `wss://api.photon.codes/v1/projects/{projectId}/events/ws?EIO=4&transport=websocket`, header `Authorization: Bearer pho_sk_...`; Engine.IO open `0{sid, pingInterval, pingTimeout}` |
+| Namespace | client `40`, server `40{sid}` (or `44{message}` = `connect_error`, treated as an auth failure) |
+| Subscribe | client `420["subscribe",{"startSeq": <saved cursor or 0>[, "apiVersion"]}]`, server ack `430[{ok, apiVersion, connectionId, cursor, limits}]`; `ok:false` → reconnect with backoff; no ack in 10 s → reconnect |
+| Delivery | server `42["delivery", <event>, {"seq", "replyExpected"}]`; the event is the webhook's event object |
+| Errors | server `42["delivery_error", {code, message, fatal, retryable, retryAfterMs?}]`; fatal ones are followed by a disconnect |
+| Heartbeat | server `2` → client `3`; silence for `pingInterval + pingTimeout` = dead connection |
+
+Processing (one delivery at a time, in order): skip `seq <= cursor` (replay); skip an event id already in the `events` table (same table and key as the webhook path: Photon's `webhook-id` *is* the event `id`); `parse_event` exactly as for webhooks; `MissionService.handle_inbound` records the event id, mission and replies in one transaction; **then** the cursor is saved in SQLite. There is no per-delivery acknowledgement in the protocol; the saved cursor is the checkpoint. A handler failure (e.g. storage down) closes the connection and resumes from the last saved cursor. Bad frames are counted (`dropped_frames`) and logged; the connection stays up.
+
+Reconnect: 1 s doubling to a 30 s cap, ×0.8–1.2 jitter, reset after a successful subscribe; `retryAfterMs` from a fatal `delivery_error` raises the wait. An auth failure (HTTP 401/403 on the upgrade, or `connect_error`) waits 5 min, never a tight loop, and `status()["last_error"]` says `authentication failed`. `stop()` cancels the session and joins the thread within 1 s. `status()`: `connected` (subscribed), `last_event_at`, `reconnects`, `dropped_frames`, `events`, `duplicates`, `last_error`, `connection_id`, `api_version`, `cursor`.
+
+The API key is never logged: our messages don't include it, exceptions are scrubbed, `repr` shows only the project, and `websockets`' own DEBUG handshake log (which prints `Authorization: Bearer ...`) goes through `locatebot.remote.photon_ws.wire`, a logger with a redacting filter.
+
+Not used: `replyExpected` / the `reply` command (synchronous HTTP replies to an event); chat replies go through the messaging API.
+
+### Offline behaviour
+- The robot link does not depend on Photon or the internet: missions in progress continue and are reported as usual.
+- Inbound reconnects quietly with backoff; `/healthz` shows `photon_connected: false` and the last error.
+- Replies stay in the SQLite outbox (`replies_pending` in `/healthz`) and `OutboxSender` retries them (2 s doubling to 300 s, 12 attempts ≈ 30 min) before giving up on a reply.
+- If the robot itself is unreachable, a new `/find` is answered "The robot is currently unavailable" (as soon as Photon is reachable again).
+
+## Run on the Pi (`tools/remote_run.py`)
+```bash
+cp .env.example .env && chmod 600 .env       # fill in PHOTON_API_KEY, PHOTON_PROJECT_ID
+.venv/bin/python tools/remote_run.py          # WebSocket inbound, live replies, operator API on 127.0.0.1:8070
+.venv/bin/python tools/remote_run.py --console --debug     # print replies instead of sending; RSS every 60 s
+# fully offline desk demo (no Photon at all): webhook inbound + the fake webhook sender
+export PHOTON_INBOUND=webhook PHOTON_MODE=console PHOTON_PROJECT_ID=pho_prj_01jabcdefghjkmnpqrstvwxyz1 \
+       PHOTON_WEBHOOK_SECRET=$(python3 -c "import base64,os;print('whsec_'+base64.b64encode(os.urandom(32)).decode())")
+.venv/bin/python tools/remote_run.py --fake-script happy &
+.venv/bin/python tools/send_fake_webhook.py --text "/find blue toolbox"
+curl -s http://127.0.0.1:8070/healthz
+```
+Flags: `--env-file` (default repo `.env`; never overrides variables already set), `--host`/`--port` (default 127.0.0.1:8070), `--robot fake` (R3 adds `zmq`), `--fake-script happy|not_found|stall|reject`, `--console`, `--debug`. Ctrl+C / SIGTERM shut down cleanly (inbound closed, HTTP server stopped, threads joined).
+
+systemd: `deploy/locatebot-remote.service` (`Restart=always`, `MemoryMax=150M`, reads `.env` via `--env-file`; adjust `User`/paths).
+
 ## Measured
-- RSS of a running `RemoteService` (console provider, `FakeRobotLink`, background thread) + `server.py` after 20 webhook deliveries: **≈ 30 MB** on the x86 laptop (Python 3.14; 23 MB for the bare interpreter + imports). Target on the Pi: < 80 MB. Not measured on the Pi yet.
+- R1: RSS of a running `RemoteService` (console provider, `FakeRobotLink`, background thread) + `server.py` after 20 webhook deliveries: **≈ 30 MB** on the x86 laptop (Python 3.14; 23 MB for the bare interpreter + imports).
+- R2: WebSocket mode (`websockets` 17.4 loaded, subscribed to a fake Photon server **in the same process**, 40 deliveries processed, HTTP server up): **≈ 38 MB**, an upper bound since it includes the fake server and pytest imports.
+- Target on the Pi: < 80 MB (`MemoryMax=150M` in the unit). Not measured on the Pi yet.
 
 ## Tests
-`tests/remote/` (all run without FastAPI/uvicorn/httpx/websockets, no network): the branch's unit tests for protocol, commands, config, photon, notifier, missions; `test_robot.py` (FakeRobotLink); `test_server.py` (real server on 127.0.0.1 port 0, urllib); `test_e2e.py` (scenarios E1–E12 from the branch, driven through `FakeRobotLink`); `test_tools.py` (`tools/send_fake_webhook.py`).
+`tests/remote/` (all run without FastAPI/uvicorn/httpx/websockets, no network): the branch's unit tests for protocol, commands, config, photon, notifier, missions; `test_robot.py` (FakeRobotLink); `test_server.py` (real server on 127.0.0.1 port 0, urllib); `test_e2e.py` (scenarios E1–E12 from the branch, driven through `FakeRobotLink`); `test_photon_ws.py` (fake Photon Socket.IO server on 127.0.0.1: happy path, duplicate id / replayed cursor, malformed frames, drop + backoff + resume, backoff cap and jitter, HTTP 401 and `connect_error` without a tight loop, rejected/timed-out subscribe, heartbeat, fatal `delivery_error` with `retryAfterMs`, handler failure resumes from the saved cursor, `stop()` < 1 s, key never in logs/`repr`/status, `RemoteService` end to end); `test_tools.py` (`tools/send_fake_webhook.py`, `tools/remote_run.py` as a real process: webhook in, reply out, SIGTERM exit 0).
 
 ## What comes next
-- **R2:** Photon WebSocket inbound (no public URL needed), `tools/remote_run.py`, systemd unit.
 - **R3:** `ZmqRobotLink` (Pi) + `MissionBridge` (Orin) over the existing ZeroMQ link.
-- **R5:** live Photon project + Telegram bot; confirm `senderId` = bot user from `receivedBy` and that `format: "plain"` is accepted; replace the synthetic `tests/fixtures/photon_message_received.json` with a captured event (PII removed).
+- **R5 (live):** real Photon project + Telegram bot. Confirm: the WebSocket handshake and our Socket.IO subset against the real server (path, `Authorization` header, `40` → subscribe ack, ping/pong timing); the subscribe ack fields and `limits`; that `delivery` events are `message.received` / `telegram.photon` with the shape `parse_event` expects; cursor resume after a Pi restart and after pulling the uplink; `delivery_error` codes seen in practice; that `senderId` = bot user from `receivedBy` and `format: "plain"` are accepted for replies; that the key's scopes cover both receiving (`project:read`) and sending. Capture one real event (PII removed) to replace the synthetic `tests/fixtures/photon_message_received.json`. Measure RSS on the Pi.
