@@ -198,8 +198,10 @@ def test_nemotron_preset_uses_nvidia_api_and_key_env(monkeypatch):
     headers, body = llm.build_request("sys", "user", [])
     assert body["model"] == "nvidia/some-nemotron" and body["tool_choice"] == "auto"
     assert any(v == "Bearer nvapi-test" for v in headers.values())
-    with pytest.raises(SystemExit):
-        mod.make_llm(argparse.Namespace(llm="nemotron", llm_model=None, llm_url=None))
+    # no --llm-model: the slug verified live on 2026-11-08 (tool calls + images)
+    llm = mod.make_llm(argparse.Namespace(llm="nemotron", llm_model=None, llm_url=None))
+    assert llm.model == "nvidia/nemotron-3.5-super-vl-120b-a12b"
+    assert body["chat_template_kwargs"] == {"enable_thinking": False} and body["parallel_tool_calls"] is False
 
 
 def test_relocalize_endpoint_needs_saved_map_mode(server):

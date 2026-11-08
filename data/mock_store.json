@@ -1,0 +1,11 @@
+{
+  "products": [
+    {"id": "paper-towels", "name": "Paper towels", "aliases": ["kitchen roll", "paper towel"], "aisle": "AISLE_2", "shelf": "middle", "qty": 14,
+     "grounding_query": "a white cylindrical pack of paper towels"},
+    {"id": "peanut-butter", "name": "Peanut butter", "aisle": "AISLE_1", "shelf": "top", "qty": 0},
+    {"id": "aa-batteries", "name": "AA batteries", "aliases": ["batteries"], "aisle": "AISLE_3", "shelf": "top", "qty": 6},
+    {"id": "potato-chips", "name": "Potato chips", "aisle": "AISLE_3", "shelf": "bottom", "qty": 5},
+    {"id": "tortilla-chips", "name": "Tortilla chips", "aisle": "AISLE_3", "shelf": "middle", "qty": 2},
+    {"id": "dish-soap", "name": "Dish soap", "aisle": "AISLE_2", "shelf": "bottom", "qty": 8}
+  ]
+}

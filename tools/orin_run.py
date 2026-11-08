@@ -11,7 +11,8 @@ LLM (optional):
   --llm claude   Anthropic API, key from the ANTHROPIC_API_KEY env var (needs internet)
   --llm local    OpenAI-compatible server, e.g. Ollama: --llm-url http://127.0.0.1:11434/v1 --llm-model <m>
   --llm nemotron NVIDIA API (OpenAI-compatible, https://integrate.api.nvidia.com/v1), key from the
-                 NVIDIA_API_KEY env var, model id from build.nvidia.com: --llm-model <id> (required)
+                 NVIDIA_API_KEY env var; thinking off. --llm-model defaults to
+                 nvidia/nemotron-3.5-super-vl-120b-a12b (load the key: set -a; source .env; set +a)
   --mode approve (default): the operator approves each LLM call on the page; --mode auto runs them.
 
 Vision (optional, needs camera frames, i.e. --pi-host): --vision [--model ... --lib ...]
@@ -175,20 +176,16 @@ class DryRunSink:
 
 
 # ---------------------------------------------------------------------- wiring
-NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1"
-
-
 def make_llm(args):
     if args.llm == "none":
         return None
-    from locatebot.agent.llm import ClaudeClient, OpenAICompatClient
+    from locatebot.agent.llm import ClaudeClient, NemotronClient, OpenAICompatClient
     if args.llm == "claude":
         return ClaudeClient(model=args.llm_model) if args.llm_model else ClaudeClient()
     if args.llm == "nemotron":
-        if not args.llm_model:
-            raise SystemExit("--llm nemotron needs --llm-model <model id from build.nvidia.com>")
-        return OpenAICompatClient(base_url=args.llm_url or NVIDIA_API_URL, model=args.llm_model,
-                                  api_key_env="NVIDIA_API_KEY")
+        # thinking off, one tool call per reply, key from NVIDIA_API_KEY (see locatebot/agent/llm.py)
+        kw = {"base_url": args.llm_url} if args.llm_url else {}
+        return NemotronClient(model=args.llm_model, **kw) if args.llm_model else NemotronClient(**kw)
     return OpenAICompatClient(base_url=args.llm_url or "http://127.0.0.1:11434/v1",
                               model=args.llm_model or "qwen2.5:7b-instruct")
 
