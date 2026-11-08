@@ -75,3 +75,112 @@ def test_concurrent_readers_do_not_break_the_writer():
     th.join()
     assert not errors
     assert lm.stats()["scans"] == 30
+
+
+# ---------------------------------------------------------------------- M1: localizing mode
+def _saved_map(tmp_path):
+    """Map a session with LiveMapper (odometry frame = first pose), save it, return the path."""
+    poses, scans = _scans(60, seed=4)
+    lm = LiveMapper(size_m=16.0)
+    for s in scans:
+        lm.add_scan(s)
+    return lm.save(tmp_path / "room")["lbmap"], poses[0]
+
+
+def _in_map_frame(start, pose):
+    return start.inverse().compose(pose)
+
+
+def test_from_saved_localizes_and_reports_mode(tmp_path):
+    from locatebot.lidar.types import Pose2D
+    path, start = _saved_map(tmp_path)
+    room = demo_room()
+    truth = demo_trajectory(60)[20]  # restart elsewhere in the room, guessed 0.3 m / 15 deg off
+    t_map = _in_map_frame(start, truth)
+    guess = Pose2D(t_map.x + 0.3, t_map.y - 0.2, t_map.theta + math.radians(15))
+    lm = LiveMapper.from_saved(path, guess=guess)
+    assert lm.localizing and lm.home == Pose2D(0.0, 0.0, 0.0)
+    st = lm.stats()
+    assert st["mode"] == "localizing" and not st["lost"] and st["last_score"] is None
+    rng = np.random.default_rng(9)
+    for i, p in enumerate(demo_trajectory(60)[20:30]):
+        lm.add_scan(simulate_scan(room, p, rng=rng, stamp_s=50.0 + 0.1 * i, seq=i))
+    est, t_last = lm.pose, _in_map_frame(start, demo_trajectory(60)[29])
+    assert math.hypot(est.x - t_last.x, est.y - t_last.y) < 0.1
+    st = lm.stats()
+    assert st["mode"] == "localizing" and st["initialized"] and not st["lost"] and not st["ambiguous"]
+    assert st["last_score"] > 0.5 and st["integrated"] == 10
+    assert lm.pose_at(50.45) is not None
+    out = lm.save(tmp_path / "room.v2")
+    _, meta = load_map(out["lbmap"])
+    assert meta["sessions"] == 2 and meta["last_session"]["mode"] == "localizing"
+
+
+def test_mapping_mode_stats_keep_old_keys():
+    _, scans = _scans(5)
+    lm = LiveMapper(size_m=16.0)
+    for s in scans:
+        lm.add_scan(s)
+    st = lm.stats()
+    assert {"scans", "integrated", "rejected"} <= set(st)
+    assert st["mode"] == "mapping" and st["lost"] is False and not lm.localizing
+    lm.relocalize(None)  # no-op when mapping
+
+
+def test_from_saved_concurrent_readers_and_relocalize(tmp_path):
+    path, start = _saved_map(tmp_path)
+    lm = LiveMapper.from_saved(path)  # no guess: global search
+    room = demo_room()
+    rng = np.random.default_rng(10)
+    poses = demo_trajectory(60)[30:50]
+    scans = [simulate_scan(room, p, rng=rng, stamp_s=80.0 + 0.1 * i, seq=i) for i, p in enumerate(poses)]
+    errors = []
+
+    def reader():
+        try:
+            for _ in range(200):
+                lm.grid_snapshot()
+                lm.pose
+                lm.stats()
+                lm.relocalize(None) if _ == 100 else None
+        except Exception as e:  # pragma: no cover - reported below
+            errors.append(e)
+
+    th = threading.Thread(target=reader)
+    th.start()
+    for s in scans:
+        lm.add_scan(s)
+    th.join()
+    assert not errors
+    st = lm.stats()
+    assert st["scans"] == 20 and st["mode"] == "localizing"
+    est, t_last = lm.pose, _in_map_frame(start, poses[-1])
+    assert math.hypot(est.x - t_last.x, est.y - t_last.y) < 0.1
+
+
+def test_layered_saved_map_reports_new_box_to_world_state_and_planning(tmp_path):
+    from locatebot.lidar.grid import OCCUPIED
+    from locatebot.mission.types import VehicleConfig
+    from locatebot.orin.runtime import OrinRuntime
+    from locatebot.orin.skills import SkillExecutor
+    path, start = _saved_map(tmp_path)
+    truth = demo_trajectory(60)[20]
+    lm = LiveMapper.from_saved(path, guess=_in_map_frame(start, truth))
+    assert lm.layers is not None and lm.stats()["layered"]
+    room = demo_room().with_box(4.6, 2.3, 5.0, 2.7)  # not in the saved map
+    rt = OrinRuntime(lm, SkillExecutor(VehicleConfig()))
+    rng = np.random.default_rng(12)
+    static0 = None
+    for i in range(8):
+        rt.on_scan(simulate_scan(room, truth, rng=rng, stamp_s=20.0 + 0.1 * i, seq=i))
+        if i == 0:
+            static0 = (lm.layers.static.classify() == OCCUPIED).sum()
+    blobs = lm.change_blobs()
+    assert len(blobs) == 1 and lm.stats()["changes"] == 1
+    ws = rt.world_state(now=21.0)
+    assert len(ws.changes) == 1 and 0.1 < ws.changes[0].width_m < 0.7
+    plan = lm.grid_snapshot()
+    assert (plan.classify() == OCCUPIED).sum() > (lm.layers.static.classify() == OCCUPIED).sum()
+    assert abs(int((lm.layers.static.classify() == OCCUPIED).sum()) - int(static0)) < 40
+    flat = LiveMapper.from_saved(path, guess=_in_map_frame(start, truth), layered=False)
+    assert flat.layers is None and flat.change_blobs() == []

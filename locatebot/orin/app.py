@@ -24,6 +24,8 @@ Operator page (stdlib HTTP, everything inline, no CDN):
 - ``POST /save_map``  ``{"name": "room1"}`` -> ``maps/<name>.lbmap/.pgm/.yaml``
 - ``POST /goal``      ``{"text": "find the bolt"}`` goal for the LLM (1-200 chars, 400 if invalid)
 - ``POST /goal/clear`` clear the goal
+- ``POST /relocalize`` ``{"x": 1.0, "y": 2.0, "theta_deg": 90}`` (or ``{}``: global search) -
+                      saved-map mode (``--map``) only: re-initialize localization
 
 POST bodies must be ``application/json`` (blocks cross-site form posts). Default bind host is
 127.0.0.1; anyone who can reach the port can command the robot.
@@ -197,6 +199,25 @@ class OrinApp:
         paths = self.runtime.mapper.save(Path(self.config.maps_dir) / name, meta={"saved_by": "operator"})
         return {k: str(v) for k, v in paths.items()}
 
+    def relocalize(self, body: dict) -> bool:
+        """Re-initialize localization in a saved map around an operator pose (``{}`` = global).
+        Returns False when the session is building a new map (nothing to localize in)."""
+        from locatebot.lidar.types import Pose2D
+        guess = None
+        if body:
+            try:
+                x, y, th = float(body["x"]), float(body["y"]), math.radians(float(body.get("theta_deg", 0.0)))
+            except (KeyError, TypeError, ValueError) as e:
+                raise ValueError("relocalize needs numbers x, y and optional theta_deg") from e
+            if not all(map(math.isfinite, (x, y, th))):
+                raise ValueError("relocalize pose must be finite")
+            guess = Pose2D(x, y, th)
+        mapper = self.runtime.mapper
+        if not getattr(mapper, "localizing", False):
+            return False
+        mapper.relocalize(guess)
+        return True
+
     def status(self) -> dict:
         out = self.runtime.status()
         with self._lock:
@@ -221,13 +242,37 @@ def _png(gray: np.ndarray) -> bytes:
             + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
-def map_png(runtime: OrinRuntime) -> bytes:
-    """Map image, north up: row 0 is the top (max y), like the PGM export."""
+def map_png(runtime: OrinRuntime, overlay: str | None = None) -> bytes:
+    """Map image, north up: row 0 is the top (max y), like the PGM export.
+
+    ``overlay="wifi"`` (M3, saved-map mode): cells with Wi-Fi readings tinted red (-90 dBm) to
+    green (-40 dBm); an RGB PNG. Without readings it is the plain grey map."""
     classes = runtime.mapper.grid_snapshot().classify()
     img = np.full(classes.shape, 160, np.uint8)
     img[classes == FREE] = 255
     img[classes == OCCUPIED] = 0
-    return _png(np.ascontiguousarray(img[::-1]))
+    wifi = runtime.mapper.layer_snapshot("wifi_rssi") if overlay == "wifi" and hasattr(
+        runtime.mapper, "layer_snapshot") else None
+    if wifi is None or wifi.shape != img.shape or not np.isfinite(wifi).any():
+        return _png(np.ascontiguousarray(img[::-1]))
+    rgb = np.repeat(img[:, :, None], 3, axis=2).astype(np.float32)
+    m = np.isfinite(wifi)
+    t = np.clip((wifi[m] + 90.0) / 50.0, 0.0, 1.0)
+    tint = np.column_stack((255 * (1 - t), 255 * t, np.full_like(t, 40)))
+    rgb[m] = 0.4 * rgb[m] + 0.6 * tint
+    return _png_rgb(np.ascontiguousarray(rgb.astype(np.uint8)[::-1]))
+
+
+def _png_rgb(rgb: np.ndarray) -> bytes:
+    """Encode an 8-bit RGB image (H, W, 3) as PNG (stdlib zlib only)."""
+    h, w, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[r].tobytes() for r in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
 def scan_json(runtime: OrinRuntime, max_points: int = 1000) -> dict:
@@ -295,7 +340,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/status":
             self._json(200, app.status())
         elif self.path.startswith("/map.png"):
-            self._send(200, map_png(app.runtime), "image/png")
+            self._send(200, map_png(app.runtime, "wifi" if "wifi=1" in self.path else None), "image/png")
         elif self.path.startswith("/scan.json"):
             self._json(200, scan_json(app.runtime))
         elif self.path == "/radar":
@@ -351,6 +396,10 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path == "/goal/clear":
                 rt.clear_goal()
                 return self._json(200, {"ok": True})
+            if self.path == "/relocalize":
+                if not app.relocalize(body):
+                    return self._json(409, {"error": "not localizing in a saved map (start with --map)"})
+                return self._json(200, {"ok": True})
             return self._json(404, {"error": "not found"})
         except (ValueError, InvalidSkillCall, json.JSONDecodeError) as e:
             return self._json(400, {"error": str(e)})
@@ -382,7 +431,7 @@ button.go{background:var(--ok);border:0}input,select{background:#222;color:var(-
 <header><h1>locatebot mission</h1><a href="/radar" style="color:#9cf">live radar</a><span id="conn" class="k">connecting...</span><button id="stop">STOP</button></header>
 <main>
 <section><h2>Map</h2><canvas id="map" width="400" height="400"></canvas>
-<div class="row k" id="mapinfo"></div>
+<div class="row k" id="mapinfo"></div><label class="k"><input type="checkbox" id="wifi"> Wi-Fi overlay</label>
 <div class="row"><input id="mapname" placeholder="map name" size="12"><button id="save">Save map</button></div></section>
 <section>
 <h2>Goal</h2><div class="row"><span id="goal" class="k">none</span></div>
@@ -411,6 +460,9 @@ $("save").onclick=async()=>{const j=await post("/save_map",{name:$("mapname").va
 const img=new Image();let imgReady=false;img.onload=()=>{imgReady=true;draw()};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
 function rows(el,pairs){el.innerHTML=pairs.map(([k,v])=>`<tr><td class="k">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
+function mapMode(m){if(m.mode!=="localizing")return "mapping (new map)";
+ const st=m.lost?"LOST":m.ambiguous?"ambiguous: give a start pose":!m.initialized?"localizing...":"localized ("+m.source+")";
+ return st+(m.last_score==null?"":" score "+m.last_score)+(m.changes?", "+m.changes+" new things":"")}
 function draw(){const s=window.lastStatus;if(!s||!imgReady)return;const c=$("map"),g=c.getContext("2d"),m=s.map_meta;
  c.width=m.width;c.height=m.height;g.imageSmoothingEnabled=false;g.drawImage(img,0,0);
  const px=(x,y)=>[(x-m.origin_xy[0])/m.resolution_m,m.height-(y-m.origin_xy[1])/m.resolution_m];
@@ -422,13 +474,13 @@ async function tick(){try{const s=await (await fetch("/status")).json();window.l
  const sk=s.skill;rows($("skill"),[["state",sk.state],["skill",sk.call?sk.call.name+" "+JSON.stringify(sk.call.args)+" ("+sk.call.source+")":"-"],
   ["detail",sk.detail||"-"],["explored",s.explored_frac==null?"-":Math.round(s.explored_frac*100)+" %"],["safety",s.safety_reason],
   ["pose",`(${s.pose.x}, ${s.pose.y}) ${s.pose.theta_deg}°`],["drive",`thr ${s.app.command.throttle}  steer ${s.app.command.steering}`],
-  ["step ms",`${s.app.last_step_ms} (max ${s.app.max_step_ms})`]]);
+  ["step ms",`${s.app.last_step_ms} (max ${s.app.max_step_ms})`],["map",mapMode(s.map)]]);
  const b=s.brain;$("brain").textContent=b?`${b.mode}${b.paused?" (paused)":""}${b.in_fallback?" FALLBACK":""} failures ${b.failures}${b.last_error?" - "+b.last_error:""}`:"none (operator only)";
  const pend=b&&b.pending;$("proposal").style.display=pend?"block":"none";if(pend)$("prop").textContent=typeof pend==="string"?pend:JSON.stringify(pend);
  rows($("items"),s.items.map(i=>[i.name,`${i.confirmed?"confirmed":"unconfirmed"} (${i.sightings}) at (${i.x}, ${i.y})`]));
  $("events").innerHTML=s.events.slice().reverse().map(e=>`<div>${esc(e.text)}</div>`).join("");
  $("mapinfo").textContent=`${s.map.integrated}/${s.map.scans} scans integrated`;
- img.src="/map.png?"+Date.now();draw()}catch(e){$("conn").textContent="disconnected"}}
+ img.src="/map.png?"+($("wifi").checked?"wifi=1&":"")+Date.now();draw()}catch(e){$("conn").textContent="disconnected"}}
 setInterval(tick,700);tick();
 </script></body></html>
 """.replace("SKILLS", _SKILL_BUTTONS)

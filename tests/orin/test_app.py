@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from locatebot.lidar.mapping import demo_room
-from locatebot.lidar.sim import simulate_scan
+from locatebot.lidar.sim import Room, simulate_scan
 from locatebot.lidar.types import Pose2D
 from locatebot.mission.types import SkillName, VehicleConfig
 from locatebot.orin.app import AppConfig, OrinApp, PeerClock, _png, make_server, map_png
@@ -200,6 +200,51 @@ def test_nemotron_preset_uses_nvidia_api_and_key_env(monkeypatch):
     assert any(v == "Bearer nvapi-test" for v in headers.values())
     with pytest.raises(SystemExit):
         mod.make_llm(argparse.Namespace(llm="nemotron", llm_model=None, llm_url=None))
+
+
+def test_relocalize_endpoint_needs_saved_map_mode(server):
+    app, base, _ = server
+    assert post(base + "/relocalize", {})[0] == 409            # building a new map
+    assert post(base + "/relocalize", {"x": "a", "y": 1})[0] == 400
+    code, body = get(base + "/status")[0], json.loads(get(base + "/status")[2])
+    assert body["map"]["mode"] == "mapping"
+
+
+def test_relocalize_endpoint_in_saved_map_mode(tmp_path):
+    from locatebot.lidar.mapping import Mapper
+    rng = np.random.default_rng(3)
+    room = Room.box(4.0, 3.0).with_box(1.0, 1.0, 1.4, 1.6)
+    m = Mapper(size_m=8.0)
+    for i in range(5):
+        m.add_scan(simulate_scan(room, Pose2D(2.5, 1.5, 0.1), rng=rng, stamp_s=i * 0.1, seq=i))
+    path = m.save(tmp_path / "box")["lbmap"]
+    rt = OrinRuntime(LiveMapper.from_saved(path, guess=Pose2D(0, 0, 0)), SkillExecutor(VehicleConfig()))
+    rt.on_scan(simulate_scan(room, Pose2D(2.5, 1.5, 0.1), rng=rng, stamp_s=1.0, seq=9))
+    app = OrinApp(rt, lambda t, s: None)
+    st = app.status()["map"]
+    assert st["mode"] == "localizing" and st["initialized"] and not st["lost"]
+    assert app.relocalize({"x": 0.1, "y": 0.0, "theta_deg": 5}) is True
+    assert app.runtime.mapper.stats()["initialized"] is False
+    with pytest.raises(ValueError):
+        app.relocalize({"x": float("nan"), "y": 0})
+
+
+def test_orin_run_sim_with_saved_map_writes_v2(tmp_path):
+    from locatebot.lidar.mapping import Mapper
+    mod = _orin_run_module()
+    src = mod.SimSource(VehicleConfig())
+    rng = np.random.default_rng(4)
+    m = Mapper(size_m=12.0)
+    for i in range(10):  # the map frame is the sim car's start pose, like a real first session
+        m.add_scan(simulate_scan(src.room, src.car.pose, n_beams=508, rng=rng, stamp_s=i * 0.1, seq=i))
+    path = m.save(tmp_path / "simroom")["lbmap"]
+    p = subprocess.run([sys.executable, str(ROOT / "tools" / "orin_run.py"), "--sim", "--port", "0", "--seconds", "3",
+                        "--map", str(path), "--start-pose", "0,0,0"],
+                       capture_output=True, text=True, timeout=60, cwd=ROOT)
+    assert p.returncode == 0, p.stderr[-2000:]
+    assert "updated map:" in p.stdout, p.stdout + p.stderr[-2000:]
+    assert (tmp_path / "simroom.v2.lbmap").exists()
+    assert mod.map_stem(Path("maps/room.2026.11.08.lbmap")) == Path("maps/room.2026.11.08")
 
 
 def test_pi_drive_sink_sends_orin_status_with_one_boot_id_per_process(monkeypatch):
