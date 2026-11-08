@@ -10,6 +10,8 @@ hardware = ["pyserial>=3.5"]
 link = ["pyzmq>=25"]
 dev = ["pytest>=7"]
 remote = ["websockets>=12"]
+# PostgreSQL storage (locatebot/storage); binary wheels exist for x86_64 and aarch64 (Pi 5, Orin)
+db = ["psycopg[binary]>=3.2"]
 pi = ["pigpio>=1.78"]
 
 [tool.pytest.ini_options]

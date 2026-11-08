@@ -67,12 +67,14 @@ class RuntimeConfig:
 
 class OrinRuntime:
     def __init__(self, mapper: LiveMapper, executor: SkillExecutor, *, brain=None, vision=None,
-                 config: RuntimeConfig | None = None, clock: Callable[[], float] = time.monotonic) -> None:
+                 config: RuntimeConfig | None = None, clock: Callable[[], float] = time.monotonic,
+                 recorder=None) -> None:
         self.mapper = mapper
         self.executor = executor
         self.brain = brain            # locatebot.agent.brain.Brain or None (operator-only)
         self.vision = vision          # locatebot.vision.service.VisionService or None
         self.missions = None          # locatebot.orin.missions.MissionBridge or None (Pi missions)
+        self.recorder = recorder      # locatebot.storage.recorder.StorageRecorder or None (no storage)
         self.config = config or RuntimeConfig()
         self.clock = clock
         self.tracker = ItemTracker(merge_radius_m=self.config.merge_radius_m,
@@ -92,6 +94,7 @@ class OrinRuntime:
         self._person_check_until = -math.inf  # M3: low-priority vision "person" check window
         self._pose_problem_text = ""          # non-empty while the localizer can't be trusted
         self._pose_lost = False
+        self._frames: deque[tuple[float, bytes]] = deque(maxlen=12)  # recent frames, for sighting photos
 
     # ------------------------------------------------------------------ inputs (any thread)
     def on_scan(self, scan: Scan) -> None:
@@ -102,6 +105,8 @@ class OrinRuntime:
     def on_frame(self, jpeg: bytes, capture_s: float) -> None:
         with self._lock:
             self._stats["frames"] += 1
+            if self.recorder is not None:
+                self._frames.append((capture_s, jpeg))
         if self.vision is not None:
             self.vision.submit_frame(jpeg, capture_s)
 
@@ -133,6 +138,12 @@ class OrinRuntime:
                         continue  # our own low-priority check: not an item the user asked for
                 track = self.tracker.update(result.item, fix)
                 self._stats["fixes"] += 1
+                if self.recorder is not None:
+                    self._record("sighting", result.item, fix.x, fix.y, fix.sigma_m, fix.range_m, f.bearing_rad,
+                                 result.capture_s, box=f.box, image=self._frame_at(result.capture_s))
+                    if track.confirmed:
+                        self._record("item", result.item, track.x, track.y, track.sigma_m, track.sightings,
+                                     True, track.last_seen_s)
                 if track.confirmed and result.item not in self._confirmed:
                     self._confirmed.add(result.item)
                     self._event(result.capture_s, f"found {result.item} at ({track.x:.1f}, {track.y:.1f})")
@@ -278,8 +289,24 @@ class OrinRuntime:
             notes=([self._pose_problem_text + "; holding still"] if self._pose_problem_text else [])
             + list(self.mapper.notes(now)))
 
+    def _frame_at(self, capture_s: float) -> bytes | None:
+        """The stored frame with exactly this capture time (the one vision ran on), if still held."""
+        for t, jpeg in reversed(self._frames):
+            if t == capture_s:
+                return jpeg
+        return None
+
+    def _record(self, what: str, *args, **kwargs) -> None:
+        """Hand one write to the storage recorder; storage problems never reach the robot."""
+        try:
+            getattr(self.recorder, what)(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            log.warning("storage %s skipped: %s", what, e)
+
     def _event(self, t: float, text: str) -> None:
         self._events.append((t, text))
+        if self.recorder is not None:
+            self._record("event", t, text)
         self._last_event = text
         log.info("event: %s", text)
 

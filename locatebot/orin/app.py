@@ -104,8 +104,9 @@ class AppConfig:
 
 class OrinApp:
     def __init__(self, runtime: OrinRuntime, drive_sink: DriveSink, *, clock: Callable[[], float] | None = None,
-                 config: AppConfig | None = None) -> None:
+                 config: AppConfig | None = None, photo_db=None) -> None:
         self.runtime = runtime
+        self.photo_db = photo_db      # locatebot.storage.reader.DBReader or None (no storage)
         self.drive_sink = drive_sink
         self.config = config or AppConfig()
         self.clock = clock or runtime.clock
@@ -197,7 +198,24 @@ class OrinApp:
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name or ""):
             raise ValueError("map name: 1-64 letters, digits, dot, dash or underscore")
         paths = self.runtime.mapper.save(Path(self.config.maps_dir) / name, meta={"saved_by": "operator"})
+        rec = self.runtime.recorder
+        if rec is not None:  # also keep the map (and a picture of it) in the shared database
+            try:
+                rec.map_snapshot(name, Path(paths["lbmap"]).read_bytes(), map_png(self.runtime))
+            except Exception as e:  # noqa: BLE001 - the file on disk is already saved
+                log.warning("map snapshot not stored: %s", e)
         return {k: str(v) for k, v in paths.items()}
+
+    def found_items(self) -> dict:
+        """Items found this session with photo URLs, from the shared database."""
+        rec, db = self.runtime.recorder, self.photo_db
+        if db is None or rec is None:
+            return {"storage": False, "items": []}
+        rows = db.items(rec.session_uid)
+        return {"storage": True, "session": rec.session_uid, "items": [
+            {"name": r["name"], "x": round(r["x"], 2), "y": round(r["y"], 2), "sightings": r["sightings"],
+             "confirmed": r["confirmed"], "photo": f"/photos/{r['photo_id']}" if r["photo_id"] else None}
+            for r in rows]}
 
     def relocalize(self, body: dict) -> bool:
         """Re-initialize localization in a saved map around an operator pose (``{}`` = global).
@@ -345,6 +363,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, scan_json(app.runtime))
         elif self.path == "/radar":
             self._send(200, RADAR_PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/api/items":
+            self._json(200, app.found_items())
+        elif re.fullmatch(r"/photos/[0-9]{1,18}", self.path):
+            got = app.photo_db.get_image(int(self.path.rsplit("/", 1)[1])) if app.photo_db is not None else None
+            if got is None:
+                self._json(404, {"error": "no such photo (or storage unavailable)"})
+            else:
+                self._send(200, got[1], got[0])
         else:
             self._json(404, {"error": "not found"})
 
@@ -444,6 +470,7 @@ button.go{background:var(--ok);border:0}input,select{background:#222;color:var(-
 <h2 style="margin-top:12px">Send a skill</h2>
 <div class="row"><select id="sname">SKILLS</select><input id="sargs" placeholder='args JSON, e.g. {"items":["marker"]}' size="26"><button id="send">Send</button></div>
 <h2 style="margin-top:12px">Items</h2><table id="items"></table>
+<div id="photos" style="display:none"><h2 style="margin-top:12px">Found item photos</h2><div id="photolist" class="row"></div></div>
 <h2 style="margin-top:12px">Events</h2><div id="events"></div>
 </section></main>
 <script>
@@ -481,7 +508,10 @@ async function tick(){try{const s=await (await fetch("/status")).json();window.l
  $("events").innerHTML=s.events.slice().reverse().map(e=>`<div>${esc(e.text)}</div>`).join("");
  $("mapinfo").textContent=`${s.map.integrated}/${s.map.scans} scans integrated`;
  img.src="/map.png?"+($("wifi").checked?"wifi=1&":"")+Date.now();draw()}catch(e){$("conn").textContent="disconnected"}}
-setInterval(tick,700);tick();
+async function photos(){try{const j=await (await fetch("/api/items")).json();if(!j.storage)return;
+ $("photos").style.display="block";
+ $("photolist").innerHTML=j.items.filter(i=>i.photo).map(i=>`<a href="${esc(i.photo)}" target="_blank" style="color:#ddd;text-decoration:none"><img src="${esc(i.photo)}" alt="${esc(i.name)}" style="width:150px;border-radius:4px;display:block"><span>${esc(i.name)}${i.confirmed?"":" (unconfirmed)"}</span></a>`).join("")||'<span class="k">none yet</span>'}catch(e){}}
+setInterval(tick,700);tick();setInterval(photos,3000);photos();
 </script></body></html>
 """.replace("SKILLS", _SKILL_BUTTONS)
 
