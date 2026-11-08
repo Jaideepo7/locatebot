@@ -213,7 +213,8 @@ def test_exploration_closed_loop(room, start):
     assert out["goals"] >= 3
     assert out["lethal"] == 0
     assert out["min_clear"] >= VEH.half_width_m
-    assert time.monotonic() - t0 < 8.0
+    # Hang guard only: about 3-4 s on an x86 laptop, about 10-11 s on the Orin Nano CPU (2026-11-08).
+    assert time.monotonic() - t0 < 60.0
 
 
 def test_explorer_failed_goal_retried_from_elsewhere():
