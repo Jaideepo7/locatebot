@@ -158,3 +158,23 @@ def test_orin_run_sim_smoke():
                        capture_output=True, text=True, timeout=60, cwd=ROOT)
     assert p.returncode == 0, p.stderr[-2000:]
     assert "operator page: http://127.0.0.1:" in p.stdout and "stopped:" in p.stdout
+
+
+def test_radar_page_and_scan_json(server):
+    app, base, _ = server
+    code, ctype, page = get(base + "/radar")
+    assert code == 200 and b"<canvas" in page and b"/scan.json" in page
+    assert b"http://" not in page and b"https://" not in page
+    code, _, raw = get(base + "/scan.json")
+    s = json.loads(raw)
+    assert s["seq"] == 4 and len(s["a"]) == len(s["r"]) == len(s["q"]) == s["n_valid"] > 100
+    assert all(r > 0 for r in s["r"]) and -180.0 <= min(s["a"]) and max(s["a"]) <= 180.0
+    assert set(s["pose"]) == {"x", "y", "theta_deg"}
+
+
+def test_scan_json_without_scans_and_downsampling():
+    from locatebot.orin.app import scan_json
+    empty = OrinRuntime(LiveMapper(size_m=8.0), SkillExecutor(VehicleConfig()))
+    assert scan_json(empty)["a"] == []
+    s = scan_json(runtime_with_map(), max_points=50)
+    assert len(s["a"]) == 50 and s["n_valid"] > 50
