@@ -9,7 +9,7 @@
 import io, json, math, os, sys, time
 from PIL import Image, ImageDraw
 from find import CAR, get, car, bearing_right_deg, locate
-from seek import detect
+from seek import detect, confirmed, BAND
 from find import locate_window
 
 OUT = os.path.join("finds", "choices")
@@ -17,6 +17,49 @@ F_PX = 1290.0                                  # measured focal length at 960 px
 
 
 QA_ID = os.environ.get("QA_ID")                 # set -> main steps also appear live in the phone app
+_SHOW = [True]                                  # post detections to the car's live-video overlay
+
+
+def show_boxes(item, boxes, W, H, kind="snap", pan_deg=0.0, labels=None):
+    """Send Orin boxes to botd so the app draws them on the live video (kind "snap" = the newest /snap photo)."""
+    if not _SHOW[0]:
+        return
+    try:
+        import urllib.request
+        bx = [{"b": [float(v) for v in b[:4]], "label": (labels[i] if labels else item)} for i, b in enumerate(boxes)]
+        body = {"label": item, "boxes": bx, "w": W, "h": H, "kind": kind, "pan_deg": pan_deg}
+        r = urllib.request.Request(CAR + "/detections", json.dumps(body).encode(), {"Content-Type": "application/json"})
+        urllib.request.urlopen(r, timeout=2).read()
+    except Exception:
+        pass
+
+
+def _overlay(fn, unpack):
+    def wrapped(jpg, item, *a, **k):
+        res = fn(jpg, item, *a, **k)
+        try:
+            boxes, W, H = unpack(res)
+            show_boxes(item, boxes, W, H)
+        except Exception:
+            pass
+        return res
+    return wrapped
+
+
+_locate_raw = locate
+
+
+def _whole(r):
+    """detect() result -> boxes for the overlay; drop horizon-strip boxes cut off at the strip's edge."""
+    boxes, W, H, how = r
+    if how.startswith("horizon strip"):
+        boxes = [b for b in boxes if b[1] > BAND[0] + 3 and b[3] < BAND[1] - 3]
+    return boxes, W, H
+
+
+detect = _overlay(detect, _whole)                                          # (boxes, W, H, how)
+locate_window = _overlay(locate_window, lambda r: (r[0], r[1], r[2]))      # (boxes, W, H)
+locate = _overlay(locate, lambda r: (r[0], r[2][0], r[2][1]))              # (boxes, ms, (W, H))
 
 
 def log(m, _t0=[time.time()]):
@@ -45,6 +88,7 @@ def scan(item):
     look = car("/look_around", 60)
     names = ((look.get("last_result") or {}).get("detail") or {}).get("photos", [])
     cands, shots = [], []
+    _SHOW[0] = False                            # look_around photos are at other pans: post them below instead
     for name in names:
         jpg = get(f"{CAR}/photo/{name}")
         pan = pan_of(name)
@@ -66,6 +110,28 @@ def scan(item):
         c["n"] = i
         # rough distance from apparent width, assuming a ~40 cm wide box (only a hint for the chooser)
         c["dist_hint_m"] = round(0.40 * F_PX / max(1, c["width"]), 1)
+    _SHOW[0] = True
+    if merged:                                  # live overlay: a still photo at the final camera position, whole
+        def labels_for(bxs, Wd):                # frame at 640 px (look photos are blurred, and the strip clips tops)
+            out = []
+            for b in bxs:
+                brg = bearing_right_deg(b, Wd, 0.0)
+                m = min(merged, key=lambda c: abs(c["bearing"] - brg))
+                out.append(f"{item} #{m['n']}" if abs(m["bearing"] - brg) <= 6 else item)
+            return out
+        try:
+            fresh = get(f"{CAR}/snap?pan=0", 30)
+            fb, _ms, (Wf, Hf) = _locate_raw(fresh, item, 640)
+            fb = confirmed(fresh, fb, item)
+            if fb:
+                show_boxes(item, fb, Wf, Hf, kind="snap", labels=labels_for(fb, Wf))
+            else:
+                for name, jpg, pan, boxes in shots:
+                    if pan == 0 and boxes:
+                        Wa, Ha = Image.open(io.BytesIO(jpg)).size
+                        show_boxes(item, boxes, Wa, Ha, kind="look", pan_deg=0.0, labels=labels_for(boxes, Wa))
+        except Exception as e:
+            log(f"overlay: {e}")
     json.dump({"item": item, "time": time.strftime("%H:%M:%S"), "choices": merged},
               open(os.path.join(OUT, "choices.json"), "w"), indent=1)
     # tagged sheet: every photo with its numbered boxes
