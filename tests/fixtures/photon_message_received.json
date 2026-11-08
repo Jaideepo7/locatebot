@@ -1,0 +1,48 @@
+{
+  "id": "pho_evt_01jabcdefghjkmnpqrstvwxyz0",
+  "type": "message.received",
+  "apiVersion": "2026-07-01",
+  "source": "telegram.photon",
+  "timestamp": "2026-11-07T12:00:00.000Z",
+  "data": {
+    "projectId": "pho_prj_01jabcdefghjkmnpqrstvwxyz1",
+    "object": {
+      "id": "pho_msg_01jabcdefghjkmnpqrstvwxyz5",
+      "projectId": "pho_prj_01jabcdefghjkmnpqrstvwxyz1",
+      "platform": "telegram",
+      "status": "received",
+      "space": {
+        "id": "pho_spc_01jabcdefghjkmnpqrstvwxyz2",
+        "projectId": "pho_prj_01jabcdefghjkmnpqrstvwxyz1",
+        "platform": "telegram",
+        "kind": "direct",
+        "participantIds": ["pho_usr_01jabcdefghjkmnpqrstvwxyz3", "pho_usr_01jabcdefghjkmnpqrstvwxyz4"],
+        "details": {},
+        "metadata": {}
+      },
+      "sentBy": {
+        "id": "pho_usr_01jabcdefghjkmnpqrstvwxyz3",
+        "projectId": "pho_prj_01jabcdefghjkmnpqrstvwxyz1",
+        "platform": "telegram",
+        "handle": "test_customer",
+        "kind": "person",
+        "details": {},
+        "metadata": {}
+      },
+      "receivedBy": {
+        "id": "pho_usr_01jabcdefghjkmnpqrstvwxyz4",
+        "projectId": "pho_prj_01jabcdefghjkmnpqrstvwxyz1",
+        "platform": "telegram",
+        "handle": "locatebot_test_bot",
+        "kind": "bot",
+        "details": {},
+        "metadata": {}
+      },
+      "content": {"type": "text", "format": "plain", "text": "/find blue toolbox"},
+      "metadata": {},
+      "createdAt": "2026-11-07T12:00:00.000Z",
+      "updatedAt": "2026-11-07T12:00:00.000Z",
+      "timestamps": {}
+    }
+  }
+}
