@@ -56,7 +56,7 @@ These scripts predate reading the repo rules and **do not follow the package inv
 | `pi/scanmatch.py`, `pi/turncal.py` | 2D ICP scan matching (rotation + shift between two scans) and a pivot calibration / closed-loop turn tool |
 | `laptop/find.py`, `laptop/seek.py` | Earlier find-and-drive loops (kept for reference; `choose.py` is the one that works) |
 | `laptop/choose.py` | **Find and drive to an object**: `scan "<what>"` → numbered choices + tagged photo sheet; `go N` → orient, drive, arrive (see below) |
-| `pi/web/` | **Phone app** served by `botd.py` at `/` (pixel-art night theme, self-hosted font, installable PWA over https): live camera, hold-to-drive D-pad, Stop, speed, camera look, and "Ask the robot" with live progress and answer photos |
+| `pi/web/` | **Phone app** served by `botd.py` at `/` (pixel-art night theme, self-hosted font, installable PWA over https): live camera, pixel joystick (drag to drive, let go to stop), Stop, speed, camera look, and "Ask the robot" with live progress and answer photos |
 | `pi/tunnel.sh`, `pi/tunnel_policy.example.yml` | Password-protected public https link to the app via ngrok (runs on the car) |
 | `laptop/qa.py` | The LLM's side of the app inbox: `watch` (blocks until a question arrives: run it in the background as a notification), `claim`, `say` (progress line), `snap`, `answer ID "text" photo.jpg ...` |
 | `laptop/deploy_app.sh`, `laptop/make_qr.py` | Copy the app + daemon to the car and check every endpoint; make a scannable QR card in the app's style |
@@ -106,6 +106,7 @@ QA_ID=1 python3 laptop/choose.py scan "yellow drill"   # QA_ID: milestones appea
 QA_ID=1 python3 laptop/choose.py go 1
 python3 laptop/qa.py answer 1 "Found it ..." finds/choices/final_choice1.jpg
 ```
+- **Joystick**: the stick position is mixed into wheel powers (`l = y + 0.6x`, `r = y - 0.6x`, scaled so the stronger wheel gets 0.30 → the speed-bar maximum as the stick is pushed further; a small centre dead zone; pure sideways spins in place at ≥ 0.36). Sent every 150 ms while held; letting go sends `/stop`. W A S D / arrows move the stick too.
 - **Hold-to-drive** (`/manual?l=&r=`): each call drives ~0.35 s, so the car stops by itself when the finger lifts or the connection drops; power capped at ±0.55; forward is refused when something is within `20 + 50 × power` cm, or when there is **no** distance reading at all; a person driving cancels any mission. Leaving the page or switching tabs sends `/stop`.
 - **Live video** (`/stream`, MJPEG): one shared camera grabber for all viewers, ~6 fps at 960 px (~760 KB/s per viewer). Requests through a tunnel (`X-Forwarded-For` set) or `?size=small` get 480×270 at ~3 fps (~38 KB/s).
 - **Progress and photos**: `POST /progress {id, text}`, `POST /upload?name=` (JPEG body) so answers can show laptop-side photos.

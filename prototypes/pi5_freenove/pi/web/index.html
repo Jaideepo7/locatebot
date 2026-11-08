@@ -74,13 +74,13 @@ h1{margin:0;font-size:34px;font-weight:700;line-height:1;color:var(--gold);lette
 
 /* controller */
 .pad-row{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:30px 8px 0}
-.dpad{display:grid;grid-template-columns:repeat(3,62px);grid-template-rows:repeat(3,62px);touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
-.dpad button{--b:var(--line);--s:var(--night-deep);background:var(--dusk-hi);border:0;margin:0;padding:0;cursor:pointer;display:grid;place-items:center;color:var(--gold);transition:transform 40ms steps(1)}
-.dpad .hub{background:var(--dusk-hi);box-shadow:0 8px 0 0 var(--night-deep)}
-.dpad .up{grid-area:1/2}.dpad .left{grid-area:2/1}.dpad .hub{grid-area:2/2}.dpad .right{grid-area:2/3}.dpad .down{grid-area:3/2}
-.dpad svg{width:26px;height:auto;shape-rendering:crispEdges}
-.dpad .left svg{transform:rotate(-90deg)}.dpad .right svg{transform:rotate(90deg)}.dpad .down svg{transform:rotate(180deg)}
-.dpad button.held,.dpad button:active{transform:translateY(var(--px));--s:transparent;background:var(--gold);color:var(--night-deep)}
+.stick{position:relative;width:176px;height:176px;flex:none;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;cursor:grab}
+.stick svg{position:absolute;display:block;shape-rendering:crispEdges}
+.stick .base{inset:0;width:100%;height:100%;filter:drop-shadow(0 8px 0 var(--night-deep))}
+.stick .knob{width:40%;height:40%;left:30%;top:30%;transform:translate(var(--kx,0px),var(--ky,0px));filter:drop-shadow(0 6px 0 var(--night-deep))}
+.stick:not(.active) .knob{transition:transform .12s steps(3)}
+.stick.active{cursor:grabbing}
+.stick.active .knob{filter:drop-shadow(0 2px 0 var(--night-deep))}
 .big{display:flex;gap:18px;align-items:center}
 .stop{--b:#ff8792;--s:var(--alarm-dk);width:104px;height:104px;border:0;background:var(--alarm);color:#fff;font-size:24px;font-weight:700;cursor:pointer;text-shadow:2px 2px var(--alarm-dk)}
 .stop:active{transform:translateY(var(--px));--s:transparent}
@@ -140,7 +140,7 @@ dialog img{display:block;max-width:94vw;max-height:86vh;--b:var(--gold);--s:var(
 dialog::backdrop{background:rgba(13,7,32,.85)}
 @media (max-width:440px){
   h1{font-size:28px}.status{gap:10px}
-  .pad-row{gap:14px}.dpad{grid-template-columns:repeat(3,56px);grid-template-rows:repeat(3,56px)}
+  .pad-row{gap:14px}.stick{width:160px;height:160px}
   .big{flex-direction:column-reverse;gap:22px}
   .stop{width:96px;height:96px}.beep{width:96px;height:40px}
 }
@@ -174,12 +174,9 @@ dialog::backdrop{background:rgba(13,7,32,.85)}
       <div id="banner" class="banner px" role="alert"></div>
 
       <div class="pad-row">
-        <div class="dpad" aria-label="Drive: hold an arrow">
-          <button class="up px" data-dir="fwd" aria-label="Forward"><svg viewBox="0 0 7 4"><path fill="currentColor" d="M3 0h1v1h1v1h1v1h1v1H0V3h1V2h1V1h1z"/></svg></button>
-          <button class="left px" data-dir="left" aria-label="Turn left"><svg viewBox="0 0 7 4"><path fill="currentColor" d="M3 0h1v1h1v1h1v1h1v1H0V3h1V2h1V1h1z"/></svg></button>
-          <span class="hub" aria-hidden="true"></span>
-          <button class="right px" data-dir="right" aria-label="Turn right"><svg viewBox="0 0 7 4"><path fill="currentColor" d="M3 0h1v1h1v1h1v1h1v1H0V3h1V2h1V1h1z"/></svg></button>
-          <button class="down px" data-dir="back" aria-label="Back up"><svg viewBox="0 0 7 4"><path fill="currentColor" d="M3 0h1v1h1v1h1v1h1v1H0V3h1V2h1V1h1z"/></svg></button>
+        <div class="stick" id="stick" role="group" tabindex="0" aria-label="Joystick: drag to drive, let go to stop">
+          <svg class="base" id="stickBase" viewBox="0 0 21 21" aria-hidden="true"></svg>
+          <svg class="knob" id="stickKnob" viewBox="0 0 9 9" aria-hidden="true"></svg>
         </div>
         <div class="big">
           <button id="beep" class="beep px" aria-label="Beep the horn">Beep</button>
@@ -199,7 +196,7 @@ dialog::backdrop{background:rgba(13,7,32,.85)}
           </div>
         </div>
       </div>
-      <p class="hint">Hold an arrow to drive. On a keyboard, use W A S D or the arrow keys, and space to stop.</p>
+      <p class="hint">Drag the stick to drive: push further to go faster, let go to stop. On a keyboard, use W A S D or the arrow keys, and space to stop.</p>
     </section>
 
     <section aria-label="Ask the robot">
@@ -324,14 +321,56 @@ function renderPower() {
 $("#power").addEventListener("click", e => { const v = e.target.closest("button")?.dataset.v; if (v) { speedPct = +v; renderPower(); } });
 renderPower();
 
-/* ---------- hold-to-drive (the car stops by itself ~0.35 s after the last command) ---------- */
-let driveTimer = null, curDir = null;
-function lr(dir) {
-  const v = speedPct / 100, t = Math.max(0.35, v * 0.9);
-  return {fwd: [v, v], back: [-v, -v], left: [-t, t], right: [t, -t]}[dir];
+/* ---------- joystick (each command drives ~0.35 s, so the car stops by itself if commands stop) ---------- */
+function pixelDisc(svg, n, paint) {                 // a crisp pixel-art disc: one rect per cell
+  const c = (n - 1) / 2, cells = [];
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const col = paint(x - c, y - c, Math.hypot(x - c, y - c));
+    if (col) cells.push(`<rect x="${x}" y="${y}" width="1.02" height="1.02" style="fill:${col}"/>`);
+  }
+  svg.innerHTML = cells.join("");
 }
-async function send(dir) {
-  const [l, r] = lr(dir);
+pixelDisc($("#stickBase"), 21, (x, y, d) => {
+  if (d > 10.4) return null;
+  if (d > 9.3) return "var(--line)";
+  const arrow = (a, b) => (a === -8 && Math.abs(b) <= 0) || (a === -7 && Math.abs(b) <= 1);   // little pixel arrows
+  if (arrow(y, x) || arrow(-y, x) || arrow(x, y) || arrow(-x, y)) return "var(--gold)";
+  if (d > 6.2 && d < 7.2) return "#33246a";
+  if ((x === 0 && Math.abs(y) <= 1) || (y === 0 && Math.abs(x) <= 1)) return "#4a3889";
+  return "var(--dusk-hi)";
+});
+pixelDisc($("#stickKnob"), 9, (x, y, d) => {
+  if (d > 4.3) return null;
+  if (d > 3.4) return "var(--ember)";
+  if ((x === -2 && y === -2) || (x === -1 && y === -2) || (x === -2 && y === -1)) return "#fff1c2";
+  if (x + y >= 3) return "#c98f32";
+  return "var(--gold)";
+});
+
+const stick = $("#stick"), knob = $("#stickKnob");
+let vec = {x: 0, y: 0}, driveTimer = null, stickHeld = false;
+const keysDown = new Set();
+function showKnob() {
+  const travel = stick.clientWidth * 0.34, q = v => Math.round(v / 4) * 4;      // move in 4 px steps: pixel feel
+  knob.style.setProperty("--kx", q(vec.x * travel) + "px");
+  knob.style.setProperty("--ky", q(-vec.y * travel) + "px");
+}
+function mix(x, y) {                                 // stick (x right, y forward) -> wheel powers, or null = stop
+  const mag = Math.min(1, Math.hypot(x, y));
+  if (mag < 0.18) return null;
+  let l = y + 0.6 * x, r = y - 0.6 * x;             // softer steering: diagonals curve, full sideways spins
+  const m = Math.max(Math.abs(l), Math.abs(r)); l /= m; r /= m;
+  const top = Math.max(0.30, speedPct / 100);
+  let p = 0.30 + (top - 0.30) * (mag - 0.18) / 0.82;   // the wheels stall below ~0.30
+  if (Math.abs(x) > Math.abs(y)) p = Math.max(p, 0.36);  // spinning in place needs a little more
+  return [l * p, r * p];
+}
+let wasMoving = false;
+async function tick() {
+  const w = mix(vec.x, vec.y);
+  if (!w) { if (wasMoving) { wasMoving = false; fetch("/stop", {cache: "no-store"}).catch(() => {}); } return; }
+  wasMoving = true;
+  const [l, r] = w;
   try {
     const res = await api(`/manual?l=${l.toFixed(2)}&r=${r.toFixed(2)}`);
     const b = $("#banner");
@@ -343,33 +382,50 @@ async function send(dir) {
     else b.classList.remove("on");
   } catch (e) {}
 }
-function startDrive(dir, el) {
-  stopDrive(false); curDir = dir; driving = true; el && el.classList.add("held");
-  send(dir); driveTimer = setInterval(() => send(dir), 150);
+function startDrive() {
+  if (driveTimer) return;
+  driving = true; tick(); driveTimer = setInterval(tick, 150);
 }
 function stopDrive(hard = true) {
   if (driveTimer) clearInterval(driveTimer);
-  driveTimer = null; curDir = null; driving = false;
-  document.querySelectorAll(".dpad .held").forEach(b => b.classList.remove("held"));
+  driveTimer = null; driving = false; stickHeld = false; wasMoving = false;
+  vec = {x: 0, y: 0}; keysDown.clear(); stick.classList.remove("active"); showKnob();
   if (hard) fetch("/stop", {cache: "no-store"}).catch(() => {});
 }
-document.querySelectorAll(".dpad button").forEach(b => {
-  b.addEventListener("pointerdown", e => { e.preventDefault(); b.setPointerCapture(e.pointerId); startDrive(b.dataset.dir, b); });
-  ["pointerup", "pointercancel", "lostpointercapture"].forEach(ev => b.addEventListener(ev, () => { if (curDir) stopDrive(true); }));
-  b.addEventListener("contextmenu", e => e.preventDefault());
+function fromPointer(e) {
+  const b = stick.getBoundingClientRect(), travel = b.width * 0.34;
+  let x = (e.clientX - (b.left + b.width / 2)) / travel, y = -(e.clientY - (b.top + b.height / 2)) / travel;
+  const m = Math.hypot(x, y); if (m > 1) { x /= m; y /= m; }
+  vec = {x, y}; showKnob();
+}
+stick.addEventListener("pointerdown", e => {
+  e.preventDefault(); stick.setPointerCapture(e.pointerId);
+  stickHeld = true; stick.classList.add("active"); fromPointer(e); startDrive();
 });
+stick.addEventListener("pointermove", e => { if (stickHeld) fromPointer(e); });
+["pointerup", "pointercancel", "lostpointercapture"].forEach(ev => stick.addEventListener(ev, () => { if (stickHeld) stopDrive(true); }));
+stick.addEventListener("contextmenu", e => e.preventDefault());
 $("#stopBtn").addEventListener("click", () => stopDrive(true));
-addEventListener("blur", () => { if (curDir) stopDrive(true); });
-document.addEventListener("visibilitychange", () => { if (document.hidden && curDir) stopDrive(true); });
-const KEYS = {ArrowUp: "fwd", w: "fwd", W: "fwd", ArrowDown: "back", s: "back", S: "back",
-              ArrowLeft: "left", a: "left", A: "left", ArrowRight: "right", d: "right", D: "right"};
+addEventListener("blur", () => { if (driveTimer) stopDrive(true); });
+document.addEventListener("visibilitychange", () => { if (document.hidden && driveTimer) stopDrive(true); });
+const KEYS = {ArrowUp: [0, 1], w: [0, 1], W: [0, 1], ArrowDown: [0, -1], s: [0, -1], S: [0, -1],
+              ArrowLeft: [-1, 0], a: [-1, 0], A: [-1, 0], ArrowRight: [1, 0], d: [1, 0], D: [1, 0]};
+function fromKeys() {
+  let x = 0, y = 0;
+  keysDown.forEach(k => { x += KEYS[k][0]; y += KEYS[k][1]; });
+  const m = Math.hypot(x, y); vec = m ? {x: x / m, y: y / m} : {x: 0, y: 0}; showKnob();
+}
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT") return;
   if (e.key === " ") { e.preventDefault(); stopDrive(true); return; }
-  const dir = KEYS[e.key];
-  if (dir && curDir !== dir) { e.preventDefault(); startDrive(dir, document.querySelector(`.dpad [data-dir=${dir}]`)); }
+  if (!KEYS[e.key]) return;
+  e.preventDefault();
+  keysDown.add(e.key); fromKeys(); stick.classList.add("active"); startDrive();
 });
-document.addEventListener("keyup", e => { if (KEYS[e.key] && KEYS[e.key] === curDir) stopDrive(true); });
+document.addEventListener("keyup", e => {
+  if (!keysDown.delete(e.key)) return;
+  if (keysDown.size) fromKeys(); else stopDrive(true);
+});
 
 /* ---------- camera look + beep ---------- */
 document.querySelectorAll("[data-pan]").forEach(b => b.onclick = () => {
