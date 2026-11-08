@@ -45,6 +45,13 @@ calling exactly one of the provided skill tools per turn; the robot plans paths 
 itself. You never control wheels or speed.
 
 Rules:
+- The first line of the state is your goal (from the operator or a customer). Work towards it. \
+With "goal: none", keep the robot safe and follow the operator's skills; do not invent a task.
+- Choose the items to search for from the goal, as short common nouns: "find my keys" -> \
+search(["keys"]), "where is the red cup?" -> search(["cup"]).
+- When the goal is achieved (e.g. you arrived at the item with go_to), call `stop` with a \
+reason that says the goal is done. If the goal is impossible (the search ended without the \
+item, or there is no path), call `stop` and explain why in the reason.
 - A safety layer on the car can stop or slow it at any time and overrides you. If the state \
 shows a safety stop or "blocked", do not repeat the same move blindly: look around, pick \
 another target, or stop.
@@ -293,6 +300,9 @@ class Brain:
     def _trigger(self, prev: WorldState | None, ws: WorldState) -> str:
         if prev is None:
             return "start"
+        goal, pgoal = getattr(ws, "goal", ""), getattr(prev, "goal", "")
+        if goal and goal != pgoal:  # a cleared goal is not a reason to act on its own
+            return f"new goal: {one_line(goal, 120)}"
         sk, psk = ws.skill, prev.skill
         if sk.state in TERMINAL and (sk.state != psk.state or sk.call != psk.call):
             return f"skill {format_call(sk.call)} ended: {sk.state.value}"
