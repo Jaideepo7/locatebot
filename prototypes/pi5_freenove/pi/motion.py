@@ -118,6 +118,15 @@ async def control_task(st, car, dry):
     while st.running:
         try:
             st.control_tick = time.time()
+            if getattr(st, "control_fault", False):
+                st.target = st.cmd = st.turn = 0.0
+                st.manual = None
+                st.manual_until = 0.0
+                st.reason = "control_fault"
+                if not dry:
+                    car.stop()
+                await asyncio.sleep(dt)
+                continue
             tick = time.time()
             srcs = []
             if tick - st.lidar_t < SENSOR_STALE_S and st.lidar_cm is not None:
@@ -189,6 +198,16 @@ async def control_task(st, car, dry):
             await asyncio.sleep(max(0.0, dt - (time.time() - tick)))
         except Exception as e:                    # never let one bad tick (I2C glitch...) kill control
             st.control_errs += 1; st.control_err = repr(e)
+            # Do not resume stale motion after a partially failed motor write.
+            first_fault = not getattr(st, "control_fault", False)
+            st.control_fault = True
+            st.target = st.cmd = st.turn = 0.0
+            st.manual = None
+            st.manual_until = 0.0
+            st.reason = "control_fault"
+            if first_fault:
+                import traceback
+                traceback.print_exc()
             try:
                 car.stop()
             except Exception:
@@ -324,14 +343,62 @@ async def photo(st, tag, events, t0, pause=True, pan_deg=0):
     return path
 
 
+HEAD_SWEEP_DEG, HEAD_PERIOD_S, HEAD_HZ = 28.0, 3.2, 15
+
+
+async def head_task(st):
+    """Cute head while wandering: the camera pans side to side with a little wobble, or looks where
+    st.head_look (deg, + = right) says - e.g. toward the side the car is about to turn to."""
+    cam = getattr(st, "cam", None)
+    if cam is None:
+        return
+    pan, last_us, t0 = 0.0, None, time.time()
+    step = 150.0 / HEAD_HZ                                   # max slew per tick (deg): smooth, servo-friendly
+    try:
+        while True:
+            look = getattr(st, "head_look", None)
+            if look is None:
+                ph = (time.time() - t0) / HEAD_PERIOD_S * 2 * math.pi
+                want = HEAD_SWEEP_DEG * math.sin(ph) + 4.0 * math.sin(2.7 * ph)
+            else:
+                want = float(look)
+            pan += max(-step, min(step, want - pan))
+            us = int(1500 - pan * PAN_US_PER_DEG)
+            if last_us is None or abs(us - last_us) >= 3:     # fewer I2C writes
+                cam.pan(us); last_us = us
+            await asyncio.sleep(1.0 / HEAD_HZ)
+    finally:
+        cam.pan(1500)
+
+
+async def look(st, deg, secs):
+    st.head_look = deg
+    await asyncio.sleep(secs)
+
+
+async def nod(st, times=2):
+    cam = getattr(st, "cam", None)
+    if cam is None:
+        return
+    for _ in range(times):
+        cam.car.pwm.set_pulse_us(9, 1570); await asyncio.sleep(0.14)
+        cam.car.pwm.set_pulse_us(9, 1480); await asyncio.sleep(0.14)
+    cam.car.pwm.set_pulse_us(9, 1500)
+
+
 async def avoid(st, events, t0):
     """Blocked ahead: brake, back up if room behind, pivot to the open side until clear."""
     st.target = 0.0; st.turn = 0.0
+    cute = getattr(st, "cute", False)
+    if cute:
+        st.head_look = 0.0                                    # face it (sharp photo)
     await asyncio.sleep(0.35)                                 # control loop brakes
     await photo(st, "blocked", events, t0, pause=False)       # what is in our way?
     bins = free_bins(st)
     left, right = side_space(bins, -1), side_space(bins, +1)
     side = 1 if right >= left else -1
+    if cute:
+        await look(st, 34.0 * side, 0.45)                     # look where we're going before turning
     rear = getattr(st, "rear_cm", 999.0)
     events.append(f"{time.time()-t0:5.1f}s AVOID front={st.clear:.0f}cm  left_space={left:.0f} right_space={right:.0f} -> turn {'RIGHT' if side > 0 else 'LEFT'}  rear={rear:.0f}cm")
     if rear > 30:
@@ -344,25 +411,95 @@ async def avoid(st, events, t0):
             break
     await hold(st, 0.42 * side, -0.42 * side, 0.15)           # a bit extra to clear the corner
     await hold(st, 0.0, 0.0, 0.2)
+    if cute:
+        st.head_look = None
+        await nod(st, 1)
     events.append(f"{time.time()-t0:5.1f}s   pivoted {time.time()-t_piv:.1f}s, front now {(st.clear if st.clear is not None else -1):.0f}cm")
 
 
-async def wander(st, speed, max_s):
-    """Mission: roam the room - cruise toward open space, avoid obstacles, never stop for long."""
-    import os
+async def escape(st, events, t0):
+    """Stuck (several avoids in a few seconds, e.g. a corner): back up further and turn until it's open."""
+    st.target = 0.0; st.turn = 0.0
+    await asyncio.sleep(0.3)
+    bins = free_bins(st)
+    side = 1 if side_space(bins, +1) >= side_space(bins, -1) else -1
+    rear = getattr(st, "rear_cm", 999.0)
+    events.append(f"{time.time()-t0:5.1f}s ESCAPE (stuck) rear={rear:.0f}cm -> back up, big turn {'RIGHT' if side > 0 else 'LEFT'}")
+    if getattr(st, "cute", False):
+        await look(st, 34.0 * side, 0.4)
+    if rear > 40:
+        await hold(st, -0.36, -0.36, 0.8)
+        await hold(st, 0.0, 0.0, 0.2)
+    t_piv = time.time()
+    while time.time() - t_piv < 4.5:                          # up to ~150 deg, until clearly open
+        await hold(st, 0.44 * side, -0.44 * side, 0.1)
+        if time.time() - t_piv > 1.2 and st.clear is not None and st.clear > 120 and (st.sonar_cm or 0) > 90:
+            break
+    await hold(st, 0.0, 0.0, 0.2)
+    st.head_look = None
+
+
+async def curious(st, events, t0):
+    """Stop in open space and have a look around (left, right, nod)."""
+    st.target = 0.0; st.turn = 0.0
+    events.append(f"{time.time()-t0:5.1f}s curious look-around")
+    await asyncio.sleep(0.3)
+    await look(st, -34.0, 0.7)
+    await look(st, 34.0, 0.9)
+    await look(st, 0.0, 0.4)
+    await nod(st, 2)
+    st.head_look = None
+
+
+async def wander(st, speed, max_s, cute=False):
+    """Mission: roam the room - cruise toward open space, avoid obstacles, never stop for long.
+    cute=True: the camera head sweeps side to side, looks before turning, stops now and then to look
+    around; no stop-and-pan photos (only "blocked")."""
+    import os, random
     events, t0 = [], time.time()
+    st.cute = cute; st.head_look = None
+    head = asyncio.create_task(head_task(st)) if cute else None
+    avoids = []
+    next_curious = time.time() + random.uniform(15, 25)
     st.target = speed / 100.0
     last_print = 0
+    try:
+        await _wander_loop(st, speed, max_s, cute, events, t0, avoids, next_curious, last_print)
+    finally:
+        if head:
+            head.cancel()
+            try:
+                await head
+            except BaseException:
+                pass
+        st.cute = False; st.head_look = None
+        cam = getattr(st, "cam", None)
+        if cam is not None:
+            cam.car.pwm.set_pulse_us(9, 1500)                # tilt level again even if cancelled mid-nod
+
+
+async def _wander_loop(st, speed, max_s, cute, events, t0, avoids, next_curious, last_print):
+    import os, random
     while time.time() - t0 < max_s:
         if os.path.exists(STOP_FILE):
             events.append(f"{time.time()-t0:5.1f}s STOP FILE -> stopping"); break
         await asyncio.sleep(0.1)
         if st.clear is not None and st.clear < AVOID_CM:
-            await avoid(st, events, t0)
+            now = time.time()
+            avoids[:] = [a for a in avoids if now - a < 12.0] + [now]
+            if len(avoids) >= 3:
+                await escape(st, events, t0); avoids.clear()
+            else:
+                await avoid(st, events, t0)
+            st.target = speed / 100.0
+            continue
+        if cute and time.time() > next_curious and st.clear is not None and st.clear > 100:
+            await curious(st, events, t0)
+            next_curious = time.time() + random.uniform(15, 25)
             st.target = speed / 100.0
             continue
         # ---- "something interesting" photo triggers ----
-        if getattr(st, "cam", None) is not None:
+        if getattr(st, "cam", None) is not None and not cute:
             now = time.time(); since = now - getattr(st, "last_photo", 0)
             bins = free_bins(st)
             side = min(((b, d) for b, d in bins.items() if 40 <= abs(b) <= 90 and d < 60), key=lambda x: x[1], default=None)

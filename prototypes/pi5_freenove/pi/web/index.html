@@ -190,6 +190,10 @@ dialog::backdrop{background:rgba(13,7,32,.85)}
           <div class="power" id="power" role="group" aria-labelledby="speedLbl"></div>
         </div>
         <div class="field">
+          <span class="lbl">Explore</span>
+          <button class="small px" id="wanderBtn">Wander</button>
+        </div>
+        <div class="field">
           <span class="lbl">Look</span>
           <div role="group" aria-label="Point the camera">
             <button class="small px" data-pan="-30">Left</button><button class="small px on" data-pan="0">Ahead</button><button class="small px" data-pan="30">Right</button>
@@ -290,7 +294,7 @@ const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
 })();
 
 /* ---------- status ---------- */
-let lastOk = 0, driving = false;
+let lastOk = 0, driving = false, wandering = false;
 function chip(el, text, cls) { el.className = "chip px " + (cls || ""); el.lastElementChild.textContent = text; }
 const MISSION = {wander: "Exploring", approach: "Approaching"};
 async function poll() {
@@ -301,6 +305,8 @@ async function poll() {
     const m = driving ? "You're driving" : s.mission ? (MISSION[s.mission] || "Claude is driving") : "Idle";
     chip($("#mode"), m, driving || s.mission ? "busy" : "");
     $("#hud-mode").textContent = m; $("#hud-front").textContent = front;
+    wandering = s.mission === "wander";
+    const wb = $("#wanderBtn"); wb.textContent = wandering ? "Stop wandering" : "Wander"; wb.classList.toggle("on", wandering);
     const warn = $("#warn");
     const why = s.control_age_s > 3 ? "The robot's controller is not responding, so it can't drive right now."
               : s.battery_adc === 0 ? "Motor power is off. Switch on the battery pack to drive." : "";
@@ -433,6 +439,11 @@ document.querySelectorAll("[data-pan]").forEach(b => b.onclick = () => {
   api("/pan?deg=" + b.dataset.pan).catch(() => {});
 });
 $("#beep").onclick = () => api("/beep?ms=150").catch(() => {});
+$("#wanderBtn").onclick = async () => {
+  const wb = $("#wanderBtn");
+  if (wandering) { await fetch("/stop", {cache: "no-store"}).catch(() => {}); wandering = false; wb.textContent = "Wander"; wb.classList.remove("on"); return; }
+  try { const r = await api("/wander?head=1&seconds=120"); if (r.ok) { wandering = true; wb.textContent = "Stop wandering"; wb.classList.add("on"); } } catch (e) {}
+};
 const cam = $("#cam");
 cam.onerror = () => { $("#cam-off").classList.add("on"); setTimeout(() => { cam.src = "/stream?t=" + Date.now(); }, 2000); };
 cam.onload = () => $("#cam-off").classList.remove("on");

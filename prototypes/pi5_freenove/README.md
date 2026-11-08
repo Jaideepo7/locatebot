@@ -26,7 +26,7 @@ Front = camera side. "Left/right" are the car's own left/right (looking forward 
 | Ultrasonic | trigger GPIO 27, echo GPIO 22 | gpiozero `DistanceSensor` |
 | IR line sensors L/M/R | GPIO 14 / 15 / 23 | 1 = surface detected |
 | Camera | CSI CAM/DISP 0 | OV5647; this mount needs **no** rotation. libcamera picks a 1080p **crop** mode: f = **1290 px at 960 px wide, HFOV 40.8°** (measured with a LiDAR-measured turn). `AeExposureMode=Short` keeps photos sharp while driving. A Camera Module 3 + third-party cable was never detected |
-| LiDAR | USB, CP2102N → `/dev/ttyUSB0` | **RPLIDAR C1**, 460800 baud, model byte `0x41`, health Good. Car front = LiDAR **182.4°** since the LiDAR was remounted on 2026-11-08 (it was 2.4° before). **Check after any remount:** `botd` `/bins` front slices must agree with the camera and the ultrasonic |
+| LiDAR | USB, CP2102N → `/dev/ttyUSB0` | **RPLIDAR C1**, 460800 baud, model byte `0x41`, health Good. Car front = LiDAR **2.4°** (182.4° while it was mounted reversed for part of 2026-11-08). **Check after any remount:** a 1 s straight drive (`/goto?bearing=0&seconds=1`) must shrink the LiDAR's front slices and grow its rear (measured 10:15: front −72 cm, rear +117 cm), and `/bins` front must agree with the camera and the ultrasonic |
 | Battery | 3 × 18650 in series (11.1–12.6 V) | Board "Power" switch feeds the Pi, "Load" feeds motors/servos. With board power off the I2C chips disappear |
 
 Motor H-bridge truth table as used here: forward channel = PWM, other = 0 → drive; both = 4095 → **short brake** (stops in ~6 cm instead of coasting); both 0 → coast.
@@ -116,6 +116,13 @@ python3 laptop/qa.py answer 1 "Found it ..." finds/choices/final_choice1.jpg
 - **From anywhere** (optional): install the ngrok agent on the car (`~/bin/ngrok`, add your authtoken), copy `pi/tunnel_policy.example.yml` to `~/car/tunnel_policy.yml` with a real password, run `pi/tunnel.sh`; it prints the https link. The app can drive a real robot: always keep the password on.
 - Measured: "Find the yellow drill" typed into the app, about 6 m away. Turned −11° → −1.6° in 3 pulses, drove straight, lost the small target on the move (watchdog stop), rescanned (found at +25°, close), 6 pulses + 3 checked hops, **stopped 30 cm in front** (ultrasonic). ~70 s, all steps shown live in the app.
 
+## Cute wander (2026-11-08)
+`/wander?head=1&seconds=120` (the app's **Wander** button): roams like `wander`, plus a camera "head".
+- **Head:** the pan servo sweeps ±28° with a small wobble (15 Hz updates, slew-limited, writes only on ≥ 3 µs change). Before an avoid turn it looks 34° toward the side it is about to turn to, then the body follows; a nod (tilt) when clear. Every 15–25 s in open space (front > 1 m) it stops, looks left, right, nods and carries on.
+- **Not hitting things:** speed 34 % by default (40 % max in this mode); the usual avoid (brake, "blocked" photo, back up if the rear is clear, pivot to the more open side); the corner escape above; no stop-and-pan photos. Any joystick use or Stop cancels it.
+- Measured, 45 s at 30 %: cruised the whole time with the head sweeping ±34°, one look-around, two avoids for a person's feet (shoe at 33 cm, dark trousers at ~50 cm: both seen and turned away from), 0 I2C errors, head re-centred at the end. Keep people a step back: 33 cm is close.
+- Head-only check without moving: `/wander?head=1&speed=0&seconds=8` (the wheels only steer while rolling; avoid still runs if something comes within 38 cm).
+
 ## Calibration numbers (2026-11-08)
 - Braked pivot pulse at 0.36 power: 0.04 s ≈ 4°, 0.06 s ≈ 7°, 0.08 s ≈ 10° (first pulse from rest smaller). The LiDAR measures a still-to-still pivot to ~0.1° (ICP noise floor 0.01°) when the turn is small.
 - Straight at 30 %: ~35 cm/s; 0.4 s hop ≈ 9 cm, ±0.8°.
@@ -142,7 +149,7 @@ Keep the wheels off the ground for first runs and a hand near the car; there is 
 ## Known problems
 - **No hardware failsafe.** The PCA9685 keeps its last PWM if the process is `kill -9`'d or hangs. Needed before unattended runs: a watchdog that pulls the PCA9685 OE pin or cuts motor power.
 - LiDAR returns inside the car's own outline (`BODY_*` in `motion.py`) are now ignored: after the remount, 8–14 cm hits at front-left made the front clearance −4 cm, so forward was always "blocked". If the front reads oddly short, check for a loose wire near the LiDAR.
-- **Corner trap:** `wander` spent ~33 s pivoting back and forth between a wall and a cart. Needs an escape rule (several avoids in a few seconds → back up and turn ~150°).
+- **Corner trap (fixed in `wander`):** it once spent ~33 s pivoting between a wall and a cart. Now three avoids within 12 s trigger an escape: back up (if the rear is clear) and turn up to ~150° until the front is open.
 - Came within ~1–3 cm of a person's dark-trousered legs: people need a camera detector and a larger margin.
 - Some event photos are blurred (taken while still turning).
 - `laptop/lr_check.py`'s phase correlation gave the **wrong** left/right answer once (low correlation peak); compare photos visually instead.
@@ -151,7 +158,8 @@ Keep the wheels off the ground for first runs and a hand near the car; there is 
 - **A remounted LiDAR silently breaks everything:** with the front angle wrong by 180°, the car braked for things behind it, crawled, and the weaker side stalled into a left pivot. Re-check `/bins` after touching the LiDAR.
 - **Fixed: an unpowered or unplugged ultrasonic froze `botd`.** gpiozero's `DistanceSensor` (default `partial=False`) waits forever for a full queue of echoes, which blocked the asyncio loop, so the control loop, missions and `/stop` all hung (seen with the battery switch off). Now `partial=True` (no echo = no update, the reading goes stale), and `/stop` cuts the motors directly before cancelling the mission.
 - `restart_botd.sh` used to report "botd up" while the new process had refused to start (the old one was still shutting down); it now waits for the old process to exit.
-- `botd.py` is not started at boot (run `pi/restart_botd.sh`), and the motor chip occasionally returns I2C `Remote I/O error` (121); the control loop now logs it (`/state.control_err`) and keeps running instead of dying silently.
+- **Fixed: I2C `Remote I/O error` (121) on the motor chip** (1–2 a minute, 39 in ~30 min). smbus2 selects the chip address and then transfers in two ioctls; the control loop and the HTTP threads (battery ADC, camera pan) interleaved them. `hw.py` now serialises every chip access with one re-entrant lock (`pi/test_hw_threading.py`): 0 errors in over an hour on the car. `motion.py` also latches a fault after a failed motor write (`reason: control_fault`, `pi/test_control_fault.py`): the car stays stopped until botd restarts rather than resuming stale motion. Both by a parallel agent (Hermes), merged here.
+- `botd.py` is not started at boot (run `pi/restart_botd.sh`), and the motor chip used to return I2C `Remote I/O error` (121) (see above); the control loop now logs it (`/state.control_err`) and keeps running instead of dying silently.
 - `seek.py`/`find.py` live-LiDAR heading tracking (`/goto` without `visual=1`) is unreliable while moving; use `choose.py`.
 
 ## `locatebot.pi.MotorDriver` for this board

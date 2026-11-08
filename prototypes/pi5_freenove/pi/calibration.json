@@ -4,7 +4,7 @@
   "back_right": 5,
   "front_right": 6,
   "swap_lr": false,
-  "lidar_front_deg": 182.4,
+  "lidar_front_deg": 2.4,
   "lidar_clockwise": true,
   "wheel_gain": {"front_left": 1.0, "back_left": 1.0, "front_right": 1.0, "back_right": 1.0}
 }

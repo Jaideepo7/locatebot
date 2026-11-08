@@ -68,6 +68,6 @@ Model weights are NVIDIA-licensed (research/non-commercial). Never add them to g
 - **pkill over SSH:** `pkill -f pattern` also matches the shell running it; use `pkill -f "[p]attern"`.
 - **Orin CPU speed:** Python planning is ~3x slower than on the x86 laptop; don't put laptop-speed wall-clock budgets in tests.
 - **pigpio on the Pi 5:** pigpio does not work on the Pi 5; GPIO code must use gpiozero / lgpio.
-- **LiDAR self-hit:** on the car the LiDAR sees the car's own body behind it (rear returns ~0); mask those angles. Car front = LiDAR **182.4°** since the 2026-11-08 remount (2.4° before); re-check after touching the LiDAR (a wrong front makes the car brake for things behind it).
+- **LiDAR self-hit:** on the car the LiDAR sees the car's own body behind it (rear returns ~0); mask those angles. Car front = LiDAR **2.4°** (it was 182.4° while the LiDAR was mounted reversed for part of 2026-11-08); verify after touching it with a 1 s straight drive (`/goto?bearing=0&seconds=1`): the LiDAR's front slices must shrink and its rear grow (a wrong front makes the car brake for things behind it and back into things).
 - **Prototype scripts break the invariants:** `prototypes/pi5_freenove/` uses clockwise degrees and treats a slice with no returns as free. Use it as a hardware reference only; never copy its conventions into `locatebot/`.
 <!-- omh:agent-instructions:end -->

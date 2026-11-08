@@ -1,7 +1,22 @@
 """Minimal drivers for the car board: PCA9685 (motors/servos), ADS7830 (ADC), SSD1306 OLED.
 Only needs smbus2 + Pillow, both already on Raspberry Pi OS."""
 import time
+import threading
+from functools import wraps
 from smbus2 import SMBus
+
+# smbus2 selects the slave address before a separate transfer ioctl. The motor
+# loop and HTTP battery/pan requests share a descriptor, so both steps (and ADC
+# command/read sequences) must run under the same reentrant lock.
+_I2C_LOCK = threading.RLock()
+
+
+def serialized_i2c(fn):
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        with _I2C_LOCK:
+            return fn(*args, **kwargs)
+    return guarded
 
 I2C_BUS = 1
 
@@ -16,6 +31,7 @@ class PCA9685:
         self.all_off()
         self.set_freq(freq)
 
+    @serialized_i2c
     def set_freq(self, freq):
         prescale = round(25_000_000 / (4096 * freq)) - 1
         old = self.bus.read_byte_data(self.addr, self.MODE1)
@@ -26,6 +42,7 @@ class PCA9685:
         self.bus.write_byte_data(self.addr, self.MODE1, 0xA0)                 # restart
         self.freq = freq
 
+    @serialized_i2c
     def set_duty(self, ch, duty):
         """duty 0..4095 (0 = fully off, 4095 = fully on)."""
         duty = max(0, min(4095, int(duty)))
@@ -41,6 +58,7 @@ class PCA9685:
         """For servos: pulse width in microseconds (about 500-2500)."""
         self.set_duty(ch, us * self.freq * 4096 / 1_000_000)
 
+    @serialized_i2c
     def all_off(self):
         self.bus.write_byte_data(self.addr, self.ALL_OFF_H, 0x10)
 
@@ -50,6 +68,7 @@ class ADS7830:
         self.bus = bus or SMBus(I2C_BUS)
         self.addr = addr
 
+    @serialized_i2c
     def raw(self, ch):
         cmd = 0x84 | ((((ch << 2) | (ch >> 1)) & 0x07) << 4)
         self.bus.write_byte(self.addr, cmd)
@@ -71,6 +90,7 @@ class OLED:
                   0xA1, 0xC8, 0xDA, 0x12, 0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6, 0xAF):
             self.bus.write_byte_data(self.addr, 0x00, c)
 
+    @serialized_i2c
     def show_image(self, img):
         img = img.convert("1")
         px = img.load()
@@ -101,5 +121,6 @@ class OLED:
             d.text((2, 46), small, font=fsmall, fill=1)
         self.show_image(img)
 
+    @serialized_i2c
     def off(self):
         self.bus.write_byte_data(self.addr, 0x00, 0xAE)
