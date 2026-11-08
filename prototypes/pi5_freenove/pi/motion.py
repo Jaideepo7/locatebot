@@ -24,7 +24,7 @@ BRAKE_S = 0.15           # active short-brake duration when we have to stop whil
 MIN_DUTY_MOTION = 700    # lower floor than car.py so "slow" is actually slow
 HALF_WIDTH_CM = 13.0     # half the car width + margin: lane that must be clear
 LIDAR_TO_FRONT_CM = 12.0 # LiDAR centre -> front bumper (estimate)
-ACCEL = 1.0              # power units per second when speeding up
+ACCEL = 0.5              # power units per second when speeding up (gentle: hard starts made the car slip/drift)
 DECEL = 3.0              # power units per second when slowing down
 HZ = 20
 SENSOR_STALE_S = 0.6
@@ -69,6 +69,7 @@ def lidar_thread(st, front_deg):
                 bins[b] = min(bins.get(b, 9999.0), d / 10.0)
             st.bins = {b: bins.get(b, UNKNOWN_CM) for b in range(-180, 181, 10)}
             st.lidar_cm = best; st.rear_cm = rear
+            st.last_scan = scan                    # raw points for scan matching (measured turns)
             st.lidar_t = time.time(); st.lidar_scans += 1
     except Exception as e:
         st.lidar_err = repr(e)
@@ -89,12 +90,13 @@ async def sonar_task(st):
         s.close()
 
 
-def limit_for(clear):
+def limit_for(clear, slow_cm=None):
+    slow = slow_cm or SLOW_CM
     if clear <= STOP_CM:
         return 0.0
-    if clear >= SLOW_CM:
+    if clear >= slow:
         return 1.0
-    return (clear - STOP_CM) / (SLOW_CM - STOP_CM)
+    return (clear - STOP_CM) / (slow - STOP_CM)
 
 
 async def control_task(st, car, dry):
@@ -103,67 +105,86 @@ async def control_task(st, car, dry):
     car.min_duty = MIN_DUTY_MOTION
     prev_clear, prev_t, vclose = None, None, 0.0
     brake_until = 0.0
+    st.control_errs = 0; st.control_err = None
     while st.running:
-        tick = time.time()
-        srcs = []
-        if tick - st.lidar_t < SENSOR_STALE_S and st.lidar_cm is not None:
-            srcs.append(("lidar", st.lidar_cm))
-        if tick - st.sonar_t < SENSOR_STALE_S and st.sonar_cm is not None:
-            srcs.append(("sonar", st.sonar_cm))
-        if srcs:
-            st.src, st.clear = min(srcs, key=lambda s: s[1])
-            # closing speed (cm/s), smoothed; only meaningful for real readings
-            if prev_clear is not None and st.clear < 500 and prev_clear < 500:
-                inst = (prev_clear - st.clear) / max(1e-3, tick - prev_t)
-                vclose = 0.6 * vclose + 0.4 * max(0.0, min(inst, 300.0))
-            prev_clear, prev_t = st.clear, tick
-            st.vclose = vclose
-            st.lim = limit_for(st.clear - vclose * LOOKAHEAD_S)
-        else:
-            st.src, st.clear, st.lim = "none", None, 0.0     # blind -> no forward motion
-
-        moving_before = st.cmd > 0
-        want = st.target * st.lim
-        if want > st.cmd:
-            st.cmd = min(want, st.cmd + ACCEL * dt)
-        else:
-            st.cmd = max(want, st.cmd - DECEL * dt)
-        if st.lim == 0.0:
-            st.cmd = 0.0                                      # hard stop, no ramp
-            if moving_before and st.target > 0:
-                brake_until = tick + BRAKE_S                  # active brake, don't coast
-        if st.cmd < 0.02:
-            st.cmd = 0.0
-
-        manual = getattr(st, "manual", None)
-        if manual and tick < st.manual_until and not dry:
-            ml, mr = manual                                   # mission override (backing up / pivoting)
-            car._apply({"front_left": ml, "back_left": ml, "front_right": mr, "back_right": mr}, 1.0)
-            st.log.append((round(tick - t0, 2), round(st.target, 2), round(st.lim, 2), round(st.cmd, 2),
-                           "MANUAL", None if st.clear is None else round(st.clear, 1),
-                           None if st.lidar_cm is None else round(st.lidar_cm, 1),
-                           None if st.sonar_cm is None else round(st.sonar_cm, 1), round(vclose)))
-            await asyncio.sleep(max(0.0, dt - (time.time() - tick)))
-            continue
-        if not dry:
-            if tick < brake_until:
-                for ch in range(8):
-                    car.pwm.set_duty(ch, 4095)
-                st.braking = True
+        try:
+            st.control_tick = time.time()
+            tick = time.time()
+            srcs = []
+            if tick - st.lidar_t < SENSOR_STALE_S and st.lidar_cm is not None:
+                srcs.append(("lidar", st.lidar_cm))
+            if tick - st.sonar_t < SENSOR_STALE_S and st.sonar_cm is not None:
+                srcs.append(("sonar", st.sonar_cm))
+            if srcs:
+                st.src, st.clear = min(srcs, key=lambda s: s[1])
+                # closing speed (cm/s), smoothed; only meaningful for real readings
+                if prev_clear is not None and st.clear < 500 and prev_clear < 500:
+                    inst = (prev_clear - st.clear) / max(1e-3, tick - prev_t)
+                    vclose = 0.6 * vclose + 0.4 * max(0.0, min(inst, 300.0))
+                prev_clear, prev_t = st.clear, tick
+                st.vclose = vclose
+                st.lim = limit_for(st.clear - vclose * LOOKAHEAD_S, getattr(st, 'slow_cm', None))
             else:
-                if getattr(st, "braking", False):
-                    car.stop(); st.braking = False
-                k = 0.45 if st.cmd > 0 else 0.0               # steer only while rolling forward
-                l = max(-1.0, min(1.0, st.cmd + st.turn * k))
-                r = max(-1.0, min(1.0, st.cmd - st.turn * k))
-                car._apply({"front_left": l, "back_left": l, "front_right": r, "back_right": r}, 1.0)
-        st.log.append((round(tick - t0, 2), round(st.target, 2), round(st.lim, 2), round(st.cmd, 2),
-                       ("BRAKE" if tick < brake_until else st.src),
-                       None if st.clear is None else round(st.clear, 1),
-                       None if st.lidar_cm is None else round(st.lidar_cm, 1),
-                       None if st.sonar_cm is None else round(st.sonar_cm, 1),
-                       round(vclose)))
-        await asyncio.sleep(max(0.0, dt - (time.time() - tick)))
+                st.src, st.clear, st.lim = "none", None, 0.0     # blind -> no forward motion
+
+            moving_before = st.cmd > 0
+            want = st.target * st.lim
+            floor = getattr(st, 'min_power', 0.0) or 0.0
+            if st.target > 0 and st.lim > 0 and want < floor:
+                want = min(floor, st.target)                  # never creep too weakly to move on this floor
+            if want > st.cmd and st.cmd == 0.0 and want >= 0.2:
+                st.cmd = want                                 # clean start: both sides break free together (no veer)
+            elif want > st.cmd:
+                st.cmd = min(want, st.cmd + ACCEL * dt)
+            else:
+                st.cmd = max(want, st.cmd - DECEL * dt)
+            if st.lim == 0.0:
+                st.cmd = 0.0                                      # hard stop, no ramp
+                if moving_before and st.target > 0:
+                    brake_until = tick + BRAKE_S                  # active brake, don't coast
+            if st.cmd < 0.02:
+                st.cmd = 0.0
+
+            manual = getattr(st, "manual", None)
+            if manual and tick < st.manual_until and not dry:
+                if manual == "brake":                             # short-brake: both H-bridge inputs on
+                    for ch in range(8):
+                        car.pwm.set_duty(ch, 4095)
+                else:
+                    ml, mr = manual                               # mission override (backing up / pivoting)
+                    car._apply({"front_left": ml, "back_left": ml, "front_right": mr, "back_right": mr}, 1.0)
+                st.log.append((round(tick - t0, 2), round(st.target, 2), round(st.lim, 2), round(st.cmd, 2),
+                               "MANUAL", None if st.clear is None else round(st.clear, 1),
+                               None if st.lidar_cm is None else round(st.lidar_cm, 1),
+                               None if st.sonar_cm is None else round(st.sonar_cm, 1), round(vclose)))
+                await asyncio.sleep(max(0.0, dt - (time.time() - tick)))
+                continue
+            if not dry:
+                if tick < brake_until:
+                    for ch in range(8):
+                        car.pwm.set_duty(ch, 4095)
+                    st.braking = True
+                else:
+                    if getattr(st, "braking", False):
+                        car.stop(); st.braking = False
+                    k = 0.45 if st.cmd > 0 else 0.0               # steer only while rolling forward
+                    l = max(-1.0, min(1.0, st.cmd + st.turn * k))
+                    r = max(-1.0, min(1.0, st.cmd - st.turn * k))
+                    car._apply({"front_left": l, "back_left": l, "front_right": r, "back_right": r}, 1.0)
+            st.log.append((round(tick - t0, 2), round(st.target, 2), round(st.lim, 2), round(st.cmd, 2),
+                           ("BRAKE" if tick < brake_until else st.src),
+                           None if st.clear is None else round(st.clear, 1),
+                           None if st.lidar_cm is None else round(st.lidar_cm, 1),
+                           None if st.sonar_cm is None else round(st.sonar_cm, 1),
+                           round(vclose)))
+            await asyncio.sleep(max(0.0, dt - (time.time() - tick)))
+        except Exception as e:                    # never let one bad tick (I2C glitch...) kill control
+            st.control_errs += 1; st.control_err = repr(e)
+            try:
+                car.stop()
+            except Exception:
+                pass
+            await asyncio.sleep(dt)
     car.stop()
 
 
@@ -233,11 +254,25 @@ class Camera:
         self.cam = Picamera2()
         self.cam.configure(self.cam.create_still_configuration(main={"size": (960, 540)}, transform=Transform()))
         self.cam.start()
+        try:   # auto exposure + white balance (true colours), but prefer SHORT exposures: sharp while moving
+            from libcamera import controls as _lc
+            self.cam.set_controls({"AeExposureMode": _lc.AeExposureModeEnum.Short})
+        except Exception:
+            pass
+        self.lock = threading.Lock()            # missions and HTTP snapshots share one camera
+
+    def capture_bytes(self):
+        import io
+        buf = io.BytesIO()
+        with self.lock:
+            self.cam.capture_file(buf, format="jpeg")
+        return buf.getvalue()
 
     def capture(self, tag, meta):
         self.n += 1
         path = f"{self.outdir}/{self.n:03d}_{tag}.jpg"
-        self.cam.capture_file(path)
+        with self.lock:
+            self.cam.capture_file(path)
         meta["file"] = self.os.path.basename(path)
         with open(f"{self.outdir}/index.jsonl", "a") as f:
             f.write(json.dumps(meta) + "\n")
@@ -245,6 +280,9 @@ class Camera:
 
     def pan(self, us):
         self.car.pwm.set_pulse_us(8, max(1000, min(2000, int(us))))
+
+
+PAN_US_PER_DEG = 14.3    # measured 2026-11-08: 220 us of pan = 15.4 deg (camera f = 1290 px @ 960, HFOV 40.8 deg)
 
 
 def nearest_objects(bins, k=4):
@@ -261,7 +299,7 @@ async def photo(st, tag, events, t0, pause=True, pan_deg=0):
     if pause:
         st.target = 0.0; st.turn = 0.0
     if pan_deg:
-        cam.pan(1500 - pan_deg * 11)          # ~11 us per degree; pan > 1500 looks LEFT
+        cam.pan(1500 - pan_deg * PAN_US_PER_DEG)   # measured: 14.3 us per degree; pan > 1500 looks LEFT
     await asyncio.sleep(0.5 if (pause or pan_deg) else 0.05)
     meta = {"t": round(time.time() - t0, 1), "tag": tag, "front_cm": None if st.clear is None else round(st.clear),
             "sonar_cm": None if st.sonar_cm is None else round(st.sonar_cm), "camera_pan_deg": pan_deg,
@@ -274,6 +312,7 @@ async def photo(st, tag, events, t0, pause=True, pan_deg=0):
     st.last_photo = time.time()
     if pause:
         st.target, st.turn = saved_target, saved_turn
+    return path
 
 
 async def avoid(st, events, t0):

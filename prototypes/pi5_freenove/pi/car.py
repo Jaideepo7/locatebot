@@ -98,6 +98,8 @@ class Car:
         a, b = WHEELS[name]
         fwd = self.cal.get(name, DEFAULT_FORWARD_CH[name])
         rev = b if fwd == a else a
+        g = (self.cal.get("wheel_gain") or {}).get(name, 1.0)   # per-wheel trim (straight-line balance)
+        power = power * g
         lo = getattr(self, "min_duty", MIN_DUTY)
         duty = 0 if power == 0 else int(lo + (MAX_DUTY - lo) * min(abs(power), 1.0))
         if power > 0:
