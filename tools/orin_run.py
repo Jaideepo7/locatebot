@@ -9,6 +9,8 @@ Sources (pick one):
 LLM (optional):
   --llm none     operator only: send skills from the page (default)
   --llm claude   Anthropic API, key from the ANTHROPIC_API_KEY env var (needs internet)
+  --llm nemotron NVIDIA-hosted Nemotron, key from the NVIDIA_API_KEY env var (needs internet;
+                 load it with: set -a; source .env; set +a)
   --llm local    OpenAI-compatible server, e.g. Ollama: --llm-url http://127.0.0.1:11434/v1 --llm-model <m>
   --mode approve (default): the operator approves each LLM call on the page; --mode auto runs them.
 
@@ -153,9 +155,11 @@ class DryRunSink:
 def make_llm(args):
     if args.llm == "none":
         return None
-    from locatebot.agent.llm import ClaudeClient, OpenAICompatClient
+    from locatebot.agent.llm import ClaudeClient, NemotronClient, OpenAICompatClient
     if args.llm == "claude":
         return ClaudeClient(model=args.llm_model) if args.llm_model else ClaudeClient()
+    if args.llm == "nemotron":
+        return NemotronClient(model=args.llm_model) if args.llm_model else NemotronClient()
     return OpenAICompatClient(base_url=args.llm_url, model=args.llm_model or "qwen2.5:7b-instruct")
 
 
@@ -167,7 +171,7 @@ def main(argv=None) -> int:
     src.add_argument("--pi-host")
     ap.add_argument("--baud", type=int, default=460800)
     ap.add_argument("--mount-offset-deg", type=float, default=0.0)
-    ap.add_argument("--llm", choices=["none", "claude", "local"], default="none")
+    ap.add_argument("--llm", choices=["none", "claude", "nemotron", "local"], default="none")
     ap.add_argument("--llm-model")
     ap.add_argument("--llm-url", default="http://127.0.0.1:11434/v1")
     ap.add_argument("--mode", choices=["approve", "auto"], default="approve")

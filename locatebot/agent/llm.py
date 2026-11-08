@@ -7,11 +7,15 @@ that exceeds ``timeout_s`` raises ``LLMTimeout`` (a subclass).
 - ``ClaudeClient``: Anthropic Messages API, ``POST {base_url}/v1/messages``. API key read from
   the ``ANTHROPIC_API_KEY`` environment variable at call time, never stored in the repo.
 - ``OpenAICompatClient``: local OpenAI-compatible server (Ollama, llama.cpp server),
-  ``POST {base_url}/chat/completions`` with ``tools``.
+  ``POST {base_url}/chat/completions`` with ``tools``. ``chat()`` runs one multi-turn request
+  (history, tool results, images) for callers that keep their own conversation.
+- ``NemotronClient``: NVIDIA's hosted API (``integrate.api.nvidia.com``), OpenAI-compatible,
+  key read from ``NVIDIA_API_KEY`` at call time. Thinking off and one tool call per reply.
 - ``FakeLLM``: scripted responses for tests.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -28,6 +32,9 @@ ANTHROPIC_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 DEFAULT_ANTHROPIC_URL = "https://api.anthropic.com"
 DEFAULT_LOCAL_URL = "http://127.0.0.1:11434/v1"  # Ollama's OpenAI-compatible endpoint
 DEFAULT_LOCAL_MODEL = "qwen2.5:7b-instruct"
+NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1"
+DEFAULT_NEMOTRON_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+NVIDIA_KEY_ENV = "NVIDIA_API_KEY"
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
@@ -48,6 +55,36 @@ class LLMError(Exception):
 class LLMTimeout(LLMError):
     def __init__(self, message: str = "timeout"):
         super().__init__(message, retryable=True)
+
+
+class LLMTruncated(LLMError):
+    """The reply hit ``max_tokens`` (OpenAI ``finish_reason: length``). Retry with a larger limit."""
+
+    def __init__(self, message: str = "response truncated (finish_reason=length)"):
+        super().__init__(message, retryable=True)
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    args: dict
+
+
+@dataclass(frozen=True)
+class ChatReply:
+    """One assistant turn from ``chat()``. ``message`` can be appended to the history as is."""
+
+    content: str
+    tool_calls: list[ToolCall]
+    finish_reason: str | None
+    message: dict
+
+
+def image_part(data: bytes, mime: str = "image/jpeg") -> dict:
+    """OpenAI-style image content part with the image inline as a data URL."""
+    return {"type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"}}
 
 
 class LLMClient(Protocol):
@@ -258,6 +295,9 @@ class OpenAICompatClient:
         api_key_env: str | None = None,
         temperature: float | None = 0.0,
         max_tokens: int | None = 1024,
+        require_api_key: bool = False,
+        parallel_tool_calls: bool | None = None,
+        extra_body: dict | None = None,
     ) -> None:
         if not model:
             raise ValueError("model must be non-empty")
@@ -266,35 +306,48 @@ class OpenAICompatClient:
         self.api_key_env = api_key_env
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.require_api_key = require_api_key
+        self.parallel_tool_calls = parallel_tool_calls
+        self.extra_body = dict(extra_body or {})
 
     def __repr__(self) -> str:
         return f"OpenAICompatClient(model={self.model!r}, url={self.url!r})"
 
-    def build_request(self, system: str, user: str, tools: list[dict]) -> tuple[dict, dict]:
-        headers = {"content-type": "application/json"}
+    def _headers(self) -> dict[str, str]:
+        headers = {"content-type": "application/json", "accept": "application/json"}
         if self.api_key_env:
             key = os.environ.get(self.api_key_env, "")
             if key:
                 headers["authorization"] = f"Bearer {key}"
-        body: dict[str, Any] = {
-            "model": self.model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "tools": [
+            elif self.require_api_key:
+                raise LLMError(f"{self.api_key_env} is not set", retryable=False)
+        return headers
+
+    def _body(self, messages: list[dict], tools: list[dict] | None, max_tokens: int | None) -> dict:
+        body: dict[str, Any] = {"model": self.model, "messages": messages, "stream": False}
+        if tools:
+            body["tools"] = [
                 {"type": "function", "function": {
                     "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
                 for t in tools
-            ],
-            "tool_choice": "auto",
-            "stream": False,
-        }
+            ]
+            body["tool_choice"] = "auto"
+            if self.parallel_tool_calls is not None:
+                body["parallel_tool_calls"] = self.parallel_tool_calls
         if self.temperature is not None:
             body["temperature"] = self.temperature
-        if self.max_tokens:
-            body["max_tokens"] = self.max_tokens
-        return headers, body
+        limit = max_tokens or self.max_tokens
+        if limit:
+            body["max_tokens"] = limit
+        body.update(self.extra_body)
+        return body
+
+    def build_request(self, system: str, user: str, tools: list[dict]) -> tuple[dict, dict]:
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        return self._headers(), self._body(messages, tools, None)
 
     @staticmethod
-    def _parse_response(data: Any) -> ToolChoice | None:
+    def _message(data: Any) -> tuple[dict, str | None]:
         try:
             choice = data["choices"][0]
             msg = choice["message"]
@@ -303,12 +356,12 @@ class OpenAICompatClient:
         if not isinstance(msg, dict):
             raise LLMError("unexpected message shape", retryable=False)
         if choice.get("finish_reason") == "length":
-            raise LLMError("response truncated (finish_reason=length)")
-        text = msg.get("content") if isinstance(msg.get("content"), str) else ""
-        calls = msg.get("tool_calls") or []
-        if not isinstance(calls, list) or not calls:
-            return None
-        fn = calls[0].get("function") if isinstance(calls[0], dict) else None
+            raise LLMTruncated()
+        return msg, choice.get("finish_reason")
+
+    @staticmethod
+    def _tool_call(call: Any) -> ToolCall:
+        fn = call.get("function") if isinstance(call, dict) else None
         if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
             raise LLMError("malformed tool call", retryable=False)
         raw = fn.get("arguments", {})
@@ -322,11 +375,80 @@ class OpenAICompatClient:
                     raise LLMError("tool arguments are not valid JSON", retryable=False) from None
         if not isinstance(raw, dict):
             raise LLMError("tool arguments are not an object", retryable=False)
-        return ToolChoice(fn["name"], raw, text.strip())
+        cid = call.get("id")
+        return ToolCall(cid if isinstance(cid, str) else "", fn["name"], raw)
+
+    @classmethod
+    def _parse_response(cls, data: Any) -> ToolChoice | None:
+        msg, _ = cls._message(data)
+        text = msg.get("content") if isinstance(msg.get("content"), str) else ""
+        calls = msg.get("tool_calls") or []
+        if not isinstance(calls, list) or not calls:
+            return None
+        call = cls._tool_call(calls[0])
+        return ToolChoice(call.name, call.args, text.strip())
+
+    @classmethod
+    def _parse_chat(cls, data: Any) -> ChatReply:
+        msg, finish = cls._message(data)
+        text = msg.get("content") if isinstance(msg.get("content"), str) else ""
+        raw_calls = msg.get("tool_calls") or []
+        if not isinstance(raw_calls, list):
+            raise LLMError("malformed tool_calls", retryable=False)
+        calls = [cls._tool_call(c) for c in raw_calls]
+        calls = [ToolCall(c.id or f"call_{i}", c.name, c.args) for i, c in enumerate(calls)]
+        message: dict[str, Any] = {"role": "assistant", "content": text}
+        if calls:
+            message["tool_calls"] = [
+                {"id": c.id, "type": "function", "function": {"name": c.name, "arguments": json.dumps(c.args)}}
+                for c in calls
+            ]
+        return ChatReply(text.strip(), calls, finish, message)
 
     def decide(self, system: str, user: str, tools: list[dict], timeout_s: float) -> ToolChoice | None:
         headers, body = self.build_request(system, user, tools)
         return self._parse_response(post_json(self.url, headers, body, timeout_s))
+
+    def chat(self, messages: list[dict], *, tools: list[dict] | None = None, timeout_s: float,
+             max_tokens: int | None = None) -> ChatReply:
+        """One request over a full message list (system/user/assistant/tool, images allowed).
+
+        ``tools`` use the same ``{name, description, input_schema}`` shape as ``decide``.
+        Raises ``LLMTruncated`` when the reply hit the token limit.
+        """
+        headers = self._headers()
+        body = self._body(messages, tools, max_tokens)
+        return self._parse_chat(post_json(self.url, headers, body, timeout_s))
+
+
+class NemotronClient(OpenAICompatClient):
+    """NVIDIA-hosted Nemotron (build.nvidia.com), OpenAI-compatible.
+
+    Verified live on 2026-11-08: tool calls with ``parallel_tool_calls: false`` and image input
+    (data URL) both work on ``nvidia/nemotron-3.5-super-vl-120b-a12b`` (the response reports
+    ``private/nvidia/nemotron-3.5-super-120b-a12b``). Thinking is off by default via
+    ``chat_template_kwargs``: reasoning tokens count against ``max_tokens`` and a small limit
+    can return ``content: null`` with ``finish_reason: length``. Needs internet.
+    """
+
+    def __init__(
+        self,
+        model: str = DEFAULT_NEMOTRON_MODEL,
+        *,
+        base_url: str = NVIDIA_API_URL,
+        api_key_env: str = NVIDIA_KEY_ENV,
+        thinking: bool = False,
+        temperature: float | None = 0.0,
+        max_tokens: int = 2048,
+    ) -> None:
+        super().__init__(
+            base_url, model, api_key_env=api_key_env, temperature=temperature, max_tokens=max_tokens,
+            require_api_key=True, parallel_tool_calls=False,
+            extra_body={"chat_template_kwargs": {"enable_thinking": bool(thinking)}},
+        )
+
+    def __repr__(self) -> str:
+        return f"NemotronClient(model={self.model!r}, url={self.url!r})"
 
 
 # --------------------------------------------------------------------------- Fake

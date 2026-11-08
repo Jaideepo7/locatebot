@@ -240,3 +240,112 @@ def test_fake_llm_hang_until_released():
     f.hang.set()
     t.join(1.0)
     assert out == [ToolChoice("stop", {})] and f.active == 0 and f.max_active == 1
+
+
+# --------------------------------------------------------------------------- Nemotron (NVIDIA API)
+
+from locatebot.agent.llm import (  # noqa: E402
+    DEFAULT_NEMOTRON_MODEL,
+    NVIDIA_API_URL,
+    ChatReply,
+    LLMTruncated,
+    NemotronClient,
+    image_part,
+)
+
+NEMO_TOOL_RESPONSE = {"model": "private/nvidia/nemotron-3.5-super-120b-a12b", "choices": [{
+    "finish_reason": "tool_calls", "message": {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call-1", "type": "function",
+         "function": {"name": "search", "arguments": "{\"items\": [\"cup\"]}"}}]}}]}
+
+
+def test_nemotron_defaults():
+    c = NemotronClient()
+    assert c.url == NVIDIA_API_URL + "/chat/completions" == "https://integrate.api.nvidia.com/v1/chat/completions"
+    assert c.model == DEFAULT_NEMOTRON_MODEL == "nvidia/nemotron-3.5-super-vl-120b-a12b"
+
+
+def test_nemotron_request_shape(server, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-not-real")
+    server.body = NEMO_TOOL_RESPONSE
+    c = NemotronClient(base_url=server.url + "/v1")
+    assert c.decide("SYS", "USER", TOOLS, 5.0) == ToolChoice("search", {"items": ["cup"]}, "")
+    path, headers, body = server.requests[0]
+    assert path == "/v1/chat/completions"
+    assert {k.lower(): v for k, v in headers.items()}["authorization"] == "Bearer nvapi-test-not-real"
+    # thinking off: reasoning tokens count against max_tokens and slow every decision
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["parallel_tool_calls"] is False
+    assert body["max_tokens"] == 2048 and body["temperature"] == 0.0
+    assert body["model"] == DEFAULT_NEMOTRON_MODEL
+
+
+def test_nemotron_thinking_on(server, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    server.body = NEMO_TOOL_RESPONSE
+    NemotronClient(base_url=server.url, thinking=True).decide("s", "u", TOOLS, 5.0)
+    assert server.requests[0][2]["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_nemotron_missing_key_is_not_retryable(monkeypatch):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    with pytest.raises(LLMError, match="NVIDIA_API_KEY") as e:
+        NemotronClient(base_url="http://127.0.0.1:9").decide("s", "u", TOOLS, 1.0)
+    assert e.value.retryable is False
+    with pytest.raises(LLMError, match="NVIDIA_API_KEY"):
+        NemotronClient(base_url="http://127.0.0.1:9").chat([{"role": "user", "content": "hi"}], timeout_s=1.0)
+
+
+def test_nemotron_hides_key(server, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-secret-999")
+    server.status = 429
+    server.body = {"error": {"type": "rate_limit", "message": "slow down"}}
+    c = NemotronClient(base_url=server.url)
+    with pytest.raises(LLMError) as e:
+        c.decide("s", "u", TOOLS, 5.0)
+    assert e.value.retryable is True and "nvapi-secret" not in str(e.value) and "nvapi-secret" not in repr(c)
+
+
+def test_truncation_is_typed():
+    with pytest.raises(LLMTruncated):
+        OpenAICompatClient._parse_response({"choices": [{"finish_reason": "length", "message": {"content": None}}]})
+
+
+def test_chat_multi_turn_with_tools_and_image(server, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    server.body = NEMO_TOOL_RESPONSE
+    c = NemotronClient(base_url=server.url)
+    img = image_part(b"\xff\xd8jpegbytes")
+    assert img == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9hqcGVnYnl0ZXM="}}
+    msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": [{"type": "text", "text": "hi"}, img]}]
+    r = c.chat(msgs, tools=TOOLS, timeout_s=5.0, max_tokens=99)
+    assert isinstance(r, ChatReply)
+    assert r.finish_reason == "tool_calls" and r.content == ""
+    assert [(t.id, t.name, t.args) for t in r.tool_calls] == [("call-1", "search", {"items": ["cup"]})]
+    # the assistant message is ready to append to the history, arguments as JSON strings
+    assert r.message["role"] == "assistant"
+    assert r.message["tool_calls"][0]["function"] == {"name": "search", "arguments": "{\"items\": [\"cup\"]}"}
+    body = server.requests[0][2]
+    assert body["messages"] == msgs and body["max_tokens"] == 99
+    assert body["tools"][0]["function"]["name"] == "explore"
+    # no tools -> no tool fields at all
+    server.body = {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": " hello "}}]}
+    r = c.chat([{"role": "user", "content": "x"}], timeout_s=5.0)
+    assert r.content == "hello" and r.tool_calls == []
+    body = server.requests[1][2]
+    assert "tools" not in body and "tool_choice" not in body and "parallel_tool_calls" not in body
+
+
+def test_chat_truncation_raises(server, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    server.body = {"choices": [{"finish_reason": "length", "message": {"content": None}}]}
+    with pytest.raises(LLMTruncated):
+        NemotronClient(base_url=server.url).chat([{"role": "user", "content": "x"}], timeout_s=5.0)
+
+
+def test_chat_bad_tool_arguments(server, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "k")
+    server.body = {"choices": [{"finish_reason": "tool_calls", "message": {"content": "", "tool_calls": [
+        {"id": "a", "function": {"name": "x", "arguments": "{nope"}}]}}]}
+    with pytest.raises(LLMError, match="JSON"):
+        NemotronClient(base_url=server.url).chat([{"role": "user", "content": "x"}], tools=TOOLS, timeout_s=5.0)
