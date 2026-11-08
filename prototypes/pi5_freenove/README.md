@@ -2,6 +2,8 @@
 
 **Status:** standalone prototype scripts, written and run on the real car on 2026-11-08. They live outside the `locatebot` package, are **not wired into `locatebot.pi`**, and have **no unit tests**. Use them as a hardware reference and a source for a real `MotorDriver`, not as production code.
 
+**Operating the car as an LLM** (bring-up checks, the botd tools, find-and-drive, answering requests from the phone app, safety rules, deploying alongside other agents): [`LLM_OPERATOR_GUIDE.md`](LLM_OPERATOR_GUIDE.md).
+
 Answers to the open hardware questions in `docs/PROJECT.md` §2 for this car: the drive is **4 DC motors through H-bridges fed by a PCA9685 PWM chip** (skid steering, no steering servo), and there are **no wheel encoders**.
 
 ## Hardware map (verified on the car)
