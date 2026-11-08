@@ -15,7 +15,10 @@ Run from the repo root.
 | `.venv/bin/python -m pytest -q` | Full test suite, no hardware needed | verified (exit 0, 2026-11-08) |
 | `.venv/bin/python tools/build_map.py --demo --out maps/demo --size 16` | Synthetic exploration → `maps/demo.lbmap/.pgm/.yaml` | verified (exit 0, 2026-11-08) |
 | `.venv/bin/python tools/build_map.py --log <file>.lbscan --out maps/<name>` | Session map from a recorded scan log | verified via test suite only (synthetic log) |
-| `.venv/bin/python tools/record_scan.py --port /dev/ttyUSB0 --out recordings/<name>.lbscan --seconds 60` | Record from a real RPLIDAR (C1 default 460800 baud; A1M8 needs `--baud 115200`) | unverified: never run against real hardware |
+| `.venv/bin/python tools/record_scan.py --port /dev/ttyUSB0 --out recordings/<name>.lbscan --seconds 60` | Record from a real RPLIDAR (C1 default 460800 baud; A1M8 needs `--baud 115200`) | verified on the real C1 (laptop + Orin, 2026-11-08): ~10 scans/s, ~508 points/scan |
+| `.venv/bin/python tools/orin_run.py --sim` | Orin runtime + operator page on a simulated room/car (http://127.0.0.1:8090/) | verified (2026-11-08, page checked in headless Chromium) |
+| `.venv/bin/python tools/orin_run.py --lidar-port /dev/ttyUSB0 --host 0.0.0.0` | Bench: live map from the LiDAR on the Orin, drive is a dry run | see docs/orin/README.md |
+| `.venv/bin/python tools/pi_drive.py --sim` | Pi control loop + manual-drive page with a fake motor | verified (2026-11-08, page checked in headless Chromium) |
 | `scripts/get_model.sh` | Download pinned q4_k model to `models/`, resumable, SHA-256 checked | verified (exit 0, 2026-11-08, x86) |
 | `scripts/build_locate_anything.sh` | Build pinned locate-anything.cpp (CLI + `liblocate_anything.so`) into `third_party/`, applying `scripts/patches/` | verified CPU on x86 (2026-11-07) and CUDA on the Orin (2026-11-08) |
 
@@ -59,4 +62,9 @@ Model weights are NVIDIA-licensed (research/non-commercial). Never add them to g
 - **Model speed:** about 50 s per photo on an x86 laptop CPU. On the Orin GPU about 2.1 s per item at 640 px; 1600 px frames run out of GPU memory. Send 640 px frames.
 - **Orin GPU memory:** the unpatched engine keeps a host copy of all weights and fails to load on the Orin's shared memory; keep `scripts/patches/locate-anything-streamed-weights.patch`.
 - **Orin power:** the Orin Nano dev kit can't be powered over USB-C; use the barrel jack.
+- **C1 spin-up:** the C1 answers SCAN at once but sends no data for ~2.2 s while its motor spins up; the driver allows 5 s before the first data.
+- **Serial port access:** Ubuntu/JetPack uses group `dialout`, Arch-based laptops use `uucp` (`sudo usermod -aG <group> $USER`, then log in again).
+- **Orin USB:** the dev kit's USB-C port is in device (gadget) mode; plug the LiDAR into a USB-A port. A LiDAR that spins but never enumerates means a charge-only cable or a loose plug.
+- **pkill over SSH:** `pkill -f pattern` also matches the shell running it; use `pkill -f "[p]attern"`.
+- **Orin CPU speed:** Python planning is ~3x slower than on the x86 laptop; don't put laptop-speed wall-clock budgets in tests.
 <!-- omh:agent-instructions:end -->

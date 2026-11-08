@@ -9,3 +9,9 @@ maps/private/
 .env
 models/
 third_party/
+
+# Recordings and maps are generated (see AGENTS.md); keep them out of git
+recordings/*.lbscan
+maps/*.lbmap
+maps/*.pgm
+maps/*.yaml

@@ -87,7 +87,7 @@ A web dashboard shows the map, the item list, found items, robot health, and off
 
 | Component | Where | Status |
 |---|---|---|
-| LiDAR driver + scan logs (`locatebot/lidar/rplidar.py`, `scanlog.py`, `tools/record_scan.py`) | Pi | **Done**, tested on synthetic byte streams only |
+| LiDAR driver + scan logs (`locatebot/lidar/rplidar.py`, `scanlog.py`, `tools/record_scan.py`) | Pi | **Done**, verified on the real C1 (2026-11-08): ~10 scans/s, ~508 points/scan, 2.2 s motor spin-up handled |
 | Obstacle detection (`detect.py`) | Pi | **Done**, synthetic tests |
 | Scan matching + odometry (`matching.py`, `odometry.py`) | Orin | **Done**, synthetic tests |
 | Occupancy grid + `.lbmap` map file (`grid.py`, `mapfile.py`) | Orin | **Done**, synthetic tests |
@@ -100,12 +100,13 @@ A web dashboard shows the map, the item list, found items, robot health, and off
 | Autonomous exploration | Orin | Planned |
 | Mission manager | Orin | Planned |
 | SpacetimeDB module + dashboard | Orin/laptop | Planned (§9) |
-| Nav-lite (`locatebot/nav/`) | Orin | In progress (§8a) |
-| LLM agent + fallback (`locatebot/agent/`) | Orin/laptop | In progress (§8a) |
-| Pi runtime + manual drive page (`locatebot/pi/`) | Pi | In progress (§8a), real motor driver needs hardware details |
-| Link transport (`locatebot/link/transport.py`) | Pi/Orin | In progress (§8a) |
+| Nav-lite (`locatebot/nav/`) | Orin | **Done**, simulation only (`docs/nav/README.md`) |
+| LLM agent + fallback (`locatebot/agent/`) | Orin/laptop | **Done**, fake LLM only; never run against a real API/model (`docs/agent/README.md`) |
+| Pi runtime + manual drive page (`locatebot/pi/`) | Pi | **Done** with a fake motor; page checked in headless Chromium; real motor driver needs hardware details (`docs/pi/README.md`) |
+| Link transport (`locatebot/link/transport.py`) | Pi/Orin | **Done**, loopback only; not on the real cable |
+| Orin runtime: live map, skills, brain wiring, operator page (`locatebot/orin/`, `tools/orin_run.py`) | Orin | **Done**, closed-loop simulation + real C1 mapping on the bench (`docs/orin/README.md`) |
 
-Nothing has run on the real car, LiDAR, camera or Orin yet.
+Verified on hardware: the C1 LiDAR (laptop and Orin), the vision model on the Orin GPU, and the full test suite on the Orin. Not yet: the car's motors, the camera, the Pi, the Pi<->Orin cable.
 
 ---
 
@@ -305,3 +306,5 @@ Priority for 24 h: E-stop + manual drive with video → mission view → health 
 | 2026-11-07 | Dashboard: mission view, health (no battery), manual drive with video + E-stop |
 | 2026-11-08 | Orin GPU needs the streamed-weights engine patch and 640 px frames (~2.1 s per item) |
 | 2026-11-08 | LLM as high-level brain through fixed skills; Nav-lite (own A* + pure pursuit + frontiers) instead of Nav2; preset routines as fallback |
+| 2026-11-08 | The LLM can answer `continue` to keep the running skill (mid-skill wake-ups otherwise restarted skills or tripped the fallback) |
+| 2026-11-08 | Search = explore, then investigate glimpses, then patrol with slow camera sweeps (LiDAR mapping finishes long before the camera has looked everywhere) |
