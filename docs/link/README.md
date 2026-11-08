@@ -24,7 +24,7 @@ Text fields of the new messages (`range`, `mission_*`, `orin_status.boot_id`) ar
 ## Clocks
 - Scan stamps, frame capture times and Pi status use the **Pi's monotonic clock**, so the Orin can match frames to scans and poses for item localization.
 - `range` stamps are the Pi's monotonic clock too, so the Orin can look up the pose at the reading.
-- `mission_request.issued_s` / `expires_s` are **Unix wall-clock** seconds (`time.time()`), the one exception: a mission comes from outside the car (Telegram). The Orin compares them with its own wall clock plus a skew tolerance, so the Pi and Orin need NTP/chrony.
+- `mission_request.issued_s` / `expires_s` are **Unix wall-clock** seconds (`time.time()`), the one exception: a mission comes from outside the car (e.g. a customer request). The Orin compares them with its own wall clock plus a skew tolerance, so the Pi and Orin need NTP/chrony.
 - `sent_s` on drive/estop is the Orin's clock, for latency diagnostics only. The Pi stamps each command with its own clock **on receipt** before passing it to `SafetySupervisor.evaluate`.
 
 ## Errors

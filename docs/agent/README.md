@@ -21,7 +21,7 @@ Unknown skill, non-object args, unknown or missing args → rejected. Strings: n
 - **Timeouts:** each request runs in a daemon thread with socket timeout = `timeout_s`, and the caller gets `LLMTimeout` at `timeout_s` wall-clock. The Brain also enforces `llm_timeout_s` on its own clock.
 
 ## Goal input
-`WorldState.goal` is the request in words ("find the bolt"), set on the Orin with `OrinRuntime.set_goal()` from the operator page (`POST /goal`) or, from R3, a Telegram `/find`. It is the first line of every prompt. Prompt rules added to `DEFAULT_SYSTEM_PROMPT`:
+`WorldState.goal` is the request in words ("find the bolt"), set on the Orin with `OrinRuntime.set_goal()` from the operator page (`POST /goal`) or a mission over the link (`MissionBridge`). It is the first line of every prompt. Prompt rules added to `DEFAULT_SYSTEM_PROMPT`:
 - work towards the goal; with `goal: none`, keep the robot safe and follow the operator, don't invent a task;
 - choose items to search for from the goal as short common nouns (`"find my keys"` → `search(["keys"])`);
 - when the goal is achieved (e.g. arrived with `go_to`), call `stop` with a reason saying it's done;

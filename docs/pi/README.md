@@ -1,6 +1,13 @@
 # Pi runtime (`locatebot/pi/`)
 
-**Status:** step 1 (manual drive + E-stop) built and tested in software only: synthetic scans, `FakeMotor`, loopback HTTP. **Nothing here has driven a real motor. Physical safety is unverified.**
+**Status:** step 1 (manual drive + E-stop) built and tested in software only: synthetic scans, `FakeMotor`, loopback HTTP. **Nothing in `locatebot.pi` has driven a real motor. Physical safety is unverified.**
+
+## The car (measured 2026-11-08)
+- **Raspberry Pi 5** (Raspberry Pi OS, Debian 13 trixie) on a **Freenove-style 4WD board**: 4 DC motors through H-bridges fed by a **PCA9685** PWM chip (I2C `0x40`), **skid steering** (tank-style, turns on the spot), no steering servo, no wheel encoders. The board's "Load" switch cuts motor/servo power; "Power" feeds the Pi.
+- Camera OV5647 on CSI with a pan/tilt servo (PCA9685 ch 8/9). HC-SR04 ultrasonic on GPIO 27 (trigger) / 22 (echo). Buzzer GPIO 17, IR line sensors GPIO 14/15/23, ADS7830 ADC `0x48` (battery on ch 2, uncalibrated), OLED `0x3C`. Battery 3 × 18650 (11.1–12.6 V).
+- RPLIDAR C1 on the Pi (USB, `/dev/ttyUSB0`). Car front = LiDAR **2.4°**; the LiDAR sees the car's own body behind it (rear returns ~0), so the rear needs an angle mask.
+- **GPIO: pigpio does not work on the Pi 5.** Use gpiozero / lgpio (the `pi` extra in `pyproject.toml` still names pigpio).
+- The real `MotorDriver` is `locatebot/pi/pca9685_motor.py` (`PCA9685SkidSteer`, below). Full pin/channel map and the prototype scripts that measured it: `prototypes/pi5_freenove/README.md` (reference only: those scripts break the package invariants).
 
 ## Design
 Every control tick (20 Hz in `tools/pi_drive.py`):
@@ -34,8 +41,9 @@ mission (Orin) ┘   (E-stop > safety stop > manual > mission)
 `--host` defaults to `127.0.0.1`; at the event set it to the Pi's own address on the team router. There is no login: anyone who can reach the port can drive. Never put real addresses in the repo. The LiDAR thread keeps the newest scan, retries after any error, and while it is down the supervisor stops the car (`scan_stale`). Ctrl+C or SIGTERM stops the motor first, then the server and LiDAR.
 
 ## Needs the real car
-- **Motor driver: placeholder.** The motor/steering interface (ESC + servo PWM, H-bridge or motor HAT) is unknown, so only `FakeMotor` exists and `pi_drive.py` always uses it. For the Pi 5 + Freenove 4WD board, `PCA9685SkidSteer` exists but is **not wired into `pi_drive.py`** and has not driven the car through `PiController` yet. The real driver must clamp to [-1, 1], make `stop()` neutral + centred, and rely on a hardware failsafe (ESC signal-loss failsafe or watchdog), because a hung Python process can't stop anything.
+- **Motor driver: not wired in.** `PCA9685SkidSteer` is the driver for this board, but `pi_drive.py` still always uses `FakeMotor`, and the driver has not driven the car through `PiController` yet. It needs a **hardware failsafe** (a watchdog that pulls the PCA9685 OE pin or cuts motor power), because the PCA9685 keeps its last PWM and a hung Python process can't stop anything.
+- **Skid steering:** the Orin's Nav-lite and the safety corridor assume a car-like (Ackermann) chassis; `set(throttle, steering)` becomes a left/right mix, so they work only approximately until a differential-drive model exists.
 - The page's JavaScript has only been syntax-checked, not run in a browser here. Test it on the laptop and phone that will be used.
 - Bench tests with the wheels off the ground and a physical kill switch in hand: hold-to-drive stops within the timeout when you release; closing the tab, switching apps and pulling Wi-Fi stop the car; E-stop from the page stops at once; release does not move the car; unplugging the LiDAR stops the car; killing `pi_drive.py` (Ctrl+C, SIGTERM, `kill -9`) stops it (`kill -9` needs the hardware failsafe).
-- Measure the loop's real tick rate and latency on the Pi 4 (supervisor evaluation on ~10 000-point C1 scans).
+- Measure the loop's real tick rate and latency on the Pi 5 (supervisor evaluation on ~10 000-point C1 scans).
 - Safety distances and timeouts are placeholders until measured (see `docs/safety/README.md`).
