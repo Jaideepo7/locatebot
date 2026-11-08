@@ -262,7 +262,7 @@ def test_rplidar_start_scan_rejects_wrong_descriptor():
 
 def test_rplidar_timeout_when_no_data():
     fake = FakeTransport({0x20: SCAN_DESCRIPTOR})
-    lidar = RPLidar("/dev/null", transport=fake)
+    lidar = RPLidar("/dev/null", transport=fake, clock=StepClock(0.5), sleep=lambda s: None)
     with pytest.raises(TimeoutError):
         next(lidar.iter_scans())
 
@@ -479,3 +479,76 @@ def test_record_scan_cli(tmp_path, capsys):
     assert rc == 0
     assert len(list(read_scan_log(out2))) == 1
     assert fakes[1].writes[-1] == b"\xa5\x25" and fakes[1].closed
+
+
+# ---------------------------------------------------------------- C1 motor spin-up (found on real hardware, 2026-11-08)
+class SpinUpTransport(FakeTransport):
+    """After SCAN: descriptor at once, then `silent_reads` empty reads (each one a serial read
+    timeout of `read_timeout_s` on `clock`), then `stream`, then silence again."""
+
+    def __init__(self, stream, silent_reads, clock, read_timeout_s=1.0):
+        super().__init__({0x20: SCAN_DESCRIPTOR})
+        self.stream = bytearray(stream)
+        self.silent_left = silent_reads
+        self.clock, self.read_timeout_s = clock, read_timeout_s
+        self.scanning = False
+
+    def write(self, b):
+        if bytes(b) == b"\xa5\x20":
+            self.scanning = True
+        return super().write(b)
+
+    def read(self, n):
+        if self.rx:
+            return super().read(n)
+        if self.scanning and self.silent_left > 0:
+            self.silent_left -= 1
+            self.clock.t += self.read_timeout_s
+            return b""
+        if self.stream:
+            out = bytes(self.stream[:n]); del self.stream[:n]
+            return out
+        self.clock.t += self.read_timeout_s
+        return b""
+
+
+class ManualClock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_c1_spin_up_silence_is_tolerated():
+    # Real C1: descriptor immediately, first node bytes about 2.2 s later (motor spin-up).
+    revs, _ = sim_stream(3)
+    clock = ManualClock()
+    fake = SpinUpTransport(revs, silent_reads=2, clock=clock)  # 2 x 1 s read timeouts
+    lidar = RPLidar("/dev/null", transport=fake, clock=clock, sleep=lambda s: None)
+    scans = list(lidar.iter_scans(max_scans=2, startup_timeout_s=5.0))
+    assert len(scans) == 2
+    assert fake.writes[-1] == STOP
+
+
+def test_sensor_silent_past_startup_grace_times_out():
+    clock = ManualClock()
+    fake = SpinUpTransport(b"", silent_reads=100, clock=clock)
+    lidar = RPLidar("/dev/null", transport=fake, clock=clock, sleep=lambda s: None)
+    with pytest.raises(TimeoutError):
+        next(lidar.iter_scans(startup_timeout_s=5.0))
+    assert clock.t <= 6.0 + 1e-9  # gave up right after the grace, not later
+    assert fake.writes[-1] == STOP
+
+
+def test_stall_after_data_started_still_times_out_at_once():
+    revs, _ = sim_stream(2)
+    clock = ManualClock()
+    fake = SpinUpTransport(revs, silent_reads=0, clock=clock)
+    lidar = RPLidar("/dev/null", transport=fake, clock=clock, sleep=lambda s: None)
+    it = lidar.iter_scans(startup_timeout_s=5.0)
+    next(it)
+    with pytest.raises(TimeoutError):
+        for _ in it:
+            pass
+    assert clock.t <= 1.0 + 1e-9  # one silent read after the stream ended, no startup grace again

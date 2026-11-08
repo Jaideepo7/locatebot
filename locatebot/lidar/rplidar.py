@@ -239,24 +239,35 @@ class RPLidar:
         self._scanning = False
         self._sleep(0.002)  # protocol asks for >= 1 ms before the next request
 
-    def iter_scans(self, max_scans: int | None = None, scan_timeout_s: float = 2.0) -> Iterator[Scan]:
+    def iter_scans(self, max_scans: int | None = None, scan_timeout_s: float = 2.0,
+                   startup_timeout_s: float = 5.0) -> Iterator[Scan]:
         """Yield full revolutions; starts scanning if needed.
 
         Raises TimeoutError if the port goes silent, or if no complete Scan has been produced
         for scan_timeout_s of wall-clock time while bytes keep arriving (garbage, or nodes that
         never set the start flag). Scanning is stopped (STOP sent) on every exit: max_scans
         reached, generator closed / loop broken, or any exception.
+
+        The C1 answers SCAN at once but sends no nodes until its motor has spun up (about 2.2 s
+        measured on hardware), so silence is tolerated for ``startup_timeout_s`` before the
+        first data; after that a single silent read is a stall.
         """
         try:
             if not self._scanning:
                 self.start_scan()
             asm = ScanAssembler(mount_offset_rad=self.mount_offset_rad, clock=self._clock)
             count = 0
-            last_scan = self._clock()
+            started = last_scan = self._clock()
+            got_data = False
             while max_scans is None or count < max_scans:
                 chunk = self._t.read(_READ_CHUNK)
                 if not chunk:
+                    if not got_data and self._clock() - started < startup_timeout_s:
+                        continue  # motor still spinning up
                     raise TimeoutError(f"no scan data from lidar within {self.timeout_s} s")
+                if not got_data:
+                    got_data = True
+                    last_scan = self._clock()  # spin-up time does not count against scan_timeout_s
                 self._buf += chunk
                 nodes, used = parse_scan_nodes(self._buf)
                 del self._buf[:used]
