@@ -1,0 +1,9 @@
+{
+  "front_left": 1,
+  "back_left": 2,
+  "back_right": 5,
+  "front_right": 6,
+  "swap_lr": false,
+  "lidar_front_deg": 2.4,
+  "lidar_clockwise": true
+}
