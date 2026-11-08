@@ -309,7 +309,7 @@ def main(argv=None) -> int:
     sim = SimSource(vehicle) if args.sim else None
     sink = sim.drive if sim else (PiDriveSink(runtime) if args.pi_host else DryRunSink())
     app = OrinApp(runtime, sink, clock=clock, config=AppConfig(maps_dir=args.maps_dir), photo_db=photo_db)
-    if args.pi_host:  # Telegram/operator missions from the Pi (docs/remote/README.md)
+    if args.pi_host:  # missions from a Pi-side sender over the link (docs/orin/README.md, "Mission bridge")
         from locatebot.orin.missions import MissionBridge
         publish = sink.queue
         if runtime.recorder is not None:

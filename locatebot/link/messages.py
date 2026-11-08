@@ -12,7 +12,7 @@ Directions and clocks
 - Pi -> Orin: ``Scan``, ``Frame``, ``PiStatus``, ``Range``. All their times are the **Pi's
   monotonic clock**, so scan stamps, range readings and frame capture times line up on the
   Orin (pose lookup for item localization uses them).
-- Pi -> Orin: ``MissionRequest``, ``MissionCancel`` (Telegram/Photon missions). The one
+- Pi -> Orin: ``MissionRequest``, ``MissionCancel`` (missions from a Pi-side sender). The one
   exception to the clock rule: ``issued_s`` / ``expires_s`` are **Unix wall-clock** seconds
   (``time.time()``) because a mission is born outside the car; the Orin compares them with its
   own wall clock and a skew tolerance, so both machines need NTP/chrony.
@@ -51,7 +51,7 @@ MAX_ID_CHARS = 64        # mission_id, boot_id, sensor
 MAX_TARGET_CHARS = 120   # MissionRequest.target
 MAX_MESSAGE_CHARS = 300  # MissionStatus.message
 MAX_REASON_CHARS = 64    # MissionCancel.reason, MissionStatus.reason (short codes, may be empty)
-# Mission states in protocol order (same names as the remote/Photon protocol).
+# Mission states in protocol order (same order as orin/missions.TRANSITIONS).
 MISSION_STATES = ("PENDING", "ACCEPTED", "SEARCHING", "TARGET_DETECTED", "APPROACHING",
                   "COMPLETED", "FAILED", "CANCELLED")
 PI_PUB_PORT = 5555

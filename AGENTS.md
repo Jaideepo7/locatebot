@@ -4,7 +4,7 @@
 Read `docs/PROJECT.md` first. It is the source of truth for architecture, status and decisions. The numbered docs `docs/00-*` to `docs/08-*` predate the Pi + Orin design and the code; where they disagree, `docs/PROJECT.md` wins.
 
 ## What this repo is
-An RC car (Raspberry Pi 4 + Jetson Orin Nano Super 8 GB + RPLIDAR C1) that maps a room with LiDAR, saves a `.lbmap` session map, then searches the map for a user-given item list with LocateAnything (q4_k GGUF via locate-anything.cpp). Python package: `locatebot/`. Subsystem docs: `docs/lidar/README.md`, `docs/vision/README.md`.
+A small robot car (Raspberry Pi 5 on a Freenove-style 4WD board + Jetson Orin Nano Super 8 GB + RPLIDAR C1 on the Pi) that maps a room with LiDAR, saves a `.lbmap` session map, then searches the map for a user-given item list with LocateAnything (q4_k GGUF via locate-anything.cpp). The car is **skid-steered** (4 DC motors via H-bridges on a PCA9685, turns on the spot, no steering servo, no wheel encoders); hardware map: `prototypes/pi5_freenove/README.md`. A store-guide agent (`locatebot/store/`) is a second use case. Telegram goes through the Node bridge in `my-spectrum-app/` to the Orin operator API. Python package: `locatebot/`. Subsystem docs: `docs/lidar/README.md`, `docs/vision/README.md`.
 
 ## Build and test
 Run from the repo root.
@@ -67,4 +67,7 @@ Model weights are NVIDIA-licensed (research/non-commercial). Never add them to g
 - **Orin USB:** the dev kit's USB-C port is in device (gadget) mode; plug the LiDAR into a USB-A port. A LiDAR that spins but never enumerates means a charge-only cable or a loose plug.
 - **pkill over SSH:** `pkill -f pattern` also matches the shell running it; use `pkill -f "[p]attern"`.
 - **Orin CPU speed:** Python planning is ~3x slower than on the x86 laptop; don't put laptop-speed wall-clock budgets in tests.
+- **pigpio on the Pi 5:** pigpio does not work on the Pi 5; GPIO code must use gpiozero / lgpio.
+- **LiDAR self-hit:** on the car the LiDAR sees the car's own body behind it (rear returns ~0); mask those angles. Car front = LiDAR 2.4°.
+- **Prototype scripts break the invariants:** `prototypes/pi5_freenove/` uses clockwise degrees and treats a slice with no returns as free. Use it as a hardware reference only; never copy its conventions into `locatebot/`.
 <!-- omh:agent-instructions:end -->

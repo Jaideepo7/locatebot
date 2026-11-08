@@ -1,10 +1,11 @@
-"""R3 end to end in simulation: Telegram /find on the Pi -> ZeroMQ (127.0.0.1) -> MissionBridge on
-the Orin -> skills on the simulated car -> statuses back -> customer replies.
+"""Mission bridge end to end in simulation: a fake Pi sends MissionRequest / MissionCancel over
+ZeroMQ (127.0.0.1) -> MissionBridge on the Orin -> skills on the simulated car -> MissionStatus
+back to the fake Pi.
 
-Pi side: the real RemoteService (MissionService, SQLite outbox, OutboxSender, background thread)
-with a console-style recording provider and the real ZmqRobotLink. Orin side: a real Publisher and
-Subscriber, MissionBridge, OrinRuntime on the simulated room/car of test_e2e_sim.py (no LLM:
-routine mode). Only Photon/Telegram, the camera model and the hardware are fake.
+Pi side: a real Publisher (mission_request / mission_cancel) and Subscriber (mission_status,
+orin_status), nothing else. Orin side: a real Publisher and Subscriber, MissionBridge, OrinRuntime
+on the simulated room/car of test_e2e_sim.py (no LLM: routine mode). Only the camera model and the
+hardware are fake.
 """
 import math
 import time
@@ -16,7 +17,7 @@ import pytest
 pytest.importorskip("zmq")
 from locatebot.lidar.sim import raycast, simulate_scan  # noqa: E402
 from locatebot.lidar.types import Pose2D  # noqa: E402
-from locatebot.link.messages import OrinStatus  # noqa: E402
+from locatebot.link.messages import MissionCancel, MissionRequest, MissionStatus, OrinStatus  # noqa: E402
 from locatebot.link.transport import Publisher, Subscriber  # noqa: E402
 from locatebot.mission.types import SkillName, SkillState  # noqa: E402
 from locatebot.nav.sim import BicycleSim  # noqa: E402
@@ -24,41 +25,57 @@ from locatebot.orin.live_map import LiveMapper  # noqa: E402
 from locatebot.orin.missions import MissionBridge  # noqa: E402
 from locatebot.orin.runtime import OrinRuntime  # noqa: E402
 from locatebot.orin.skills import ExecutorConfig, SkillExecutor  # noqa: E402
-from locatebot.remote.config import Settings  # noqa: E402
-from locatebot.remote.messaging import Conversation, ConsoleProvider, InboundMessage, SendResult  # noqa: E402
-from locatebot.remote.robot_zmq import ZmqRobotLink  # noqa: E402
-from locatebot.remote.service import RemoteService  # noqa: E402
 from locatebot.vision.service import VisionService  # noqa: E402
 
 from .test_e2e_sim import DT, HFOV, VEH, FakeEngine, fake_jpeg, room_with_items  # noqa: E402
 
 LOCAL = "tcp://127.0.0.1:*"
-PROJECT = "pho_prj_01jabcdefghjkmnpqrstvwxyz1"
-SPACE, USER, BOT = "pho_spc_01jaaaaaaaaaaaaaaaaaaaaaaa", "pho_usr_01jaaaaaaaaaaaaaaaaaaaaaaa", "pho_usr_01jbot"
 ITEMS = {"marker": (3.75, 2.4), "bolt": (5.3, 4.5)}
+TTL_S = 600.0
 
 
-class Telegram(ConsoleProvider):
-    """ConsoleProvider that also records what the customer would read."""
+class FakePi:
+    """The Pi's half of the mission link: publishes requests/cancels, collects statuses."""
 
-    def __init__(self):
-        self.chat = []
+    def __init__(self, orin_endpoint):
+        self.pub = Publisher(LOCAL)
+        self.sub = Subscriber(orin_endpoint, ["mission_status", "orin_status"])
+        self.statuses: list[MissionStatus] = []
+        self.heard_orin = False
 
-    def send_text(self, conversation, text, idempotency_key):
-        self.chat.append(text)
-        return SendResult(True)
+    def poll(self):
+        for msg in self.sub.poll(0.0):
+            if isinstance(msg, MissionStatus):
+                self.statuses.append(msg)
+            elif isinstance(msg, OrinStatus):
+                self.heard_orin = True
+
+    def request(self, target):
+        mid = uuid.uuid4().hex
+        now = time.time()
+        self.pub.send(MissionRequest(mid, target, now, now + TTL_S))
+        return mid
+
+    def cancel(self, mid, reason="customer"):
+        self.pub.send(MissionCancel(mid, reason))
+
+    def states(self, mid):
+        return [s.state for s in self.statuses if s.mission_id == mid]
+
+    def last(self, mid):
+        mine = [s for s in self.statuses if s.mission_id == mid]
+        return mine[-1] if mine else None
+
+    def close(self):
+        self.sub.close()
+        self.pub.close()
 
 
 class Rig:
-    def __init__(self, tmp_path, search_timeout_s=600.0):
-        self.telegram = Telegram()
+    def __init__(self, search_timeout_s=600.0):
         self.orin_pub = Publisher(LOCAL)
-        self.link = ZmqRobotLink(self.orin_pub.endpoint, pub_endpoint=LOCAL, poll_s=0.01)
-        settings = Settings.from_env({"PHOTON_MODE": "console", "PHOTON_INBOUND": "webhook",
-                                      "PHOTON_WEBHOOK_SECRET": "whsec_" + "a" * 43 + "=", "PHOTON_PROJECT_ID": PROJECT,
-                                      "DISPATCH_DB_PATH": str(tmp_path / "pi.db")})
-        self.pi = RemoteService(settings, provider=self.telegram, link=self.link, tick_s=0.05)
-        self.orin_sub = Subscriber(self.link.pub_endpoint, ["mission_request", "mission_cancel"])
+        self.pi = FakePi(self.orin_pub.endpoint)
+        self.orin_sub = Subscriber(self.pi.pub.endpoint, ["mission_request", "mission_cancel"])
         # Orin: simulated room + car, vision on a fake engine, no LLM (routine mode)
         self.room = room_with_items(ITEMS)
         self.car = BicycleSim(VEH, Pose2D(1.0, 1.0, 0.2), dt=0.05)
@@ -77,17 +94,12 @@ class Rig:
         self.sent_statuses = []
         self.last_heartbeat = -1.0
         self.vision.start()
-        self.pi.start()
 
     def close(self):
         self.vision.stop(timeout=2.0)
-        self.pi.stop()
+        self.pi.close()
         self.orin_sub.close()
         self.orin_pub.close()
-
-    def customer(self, text):
-        msg = InboundMessage("pho_evt_" + uuid.uuid4().hex[:26], Conversation("photon", SPACE, BOT), USER, "c", text)
-        self.pi.missions.handle_inbound(msg)
 
     def step(self):
         """One 0.1 s step of the Orin: link in, sensors, control (+ bridge), statuses out, car."""
@@ -125,6 +137,7 @@ class Rig:
             self.car.step(out.throttle, out.steering)
         self.sim_t += DT
         self.k += 1
+        self.pi.poll()
 
     def run_until(self, cond, max_sim_s=300.0, wall_s=30.0):
         end_sim, end_wall = self.sim_t + max_sim_s, time.monotonic() + wall_s
@@ -134,24 +147,18 @@ class Rig:
             self.step()
         return cond()
 
-    def wait_replies(self, n, wall_s=3.0):
-        """Keep the Orin stepping while the Pi delivers replies (its thread runs every 0.05 s)."""
-        return self.run_until(lambda: len(self.telegram.chat) >= n, max_sim_s=wall_s * 10, wall_s=wall_s)
-
     def connect(self):
-        assert self.run_until(lambda: self.link.connected, wall_s=5.0), "Pi never heard the Orin"
+        assert self.run_until(lambda: self.pi.heard_orin, wall_s=5.0), "Pi never heard the Orin"
         t = time.monotonic() + 0.3  # slow joiner: let the Orin's SUB reach the Pi's PUB
         self.run_until(lambda: time.monotonic() > t, wall_s=1.0)
 
 
 @pytest.fixture
-def make_rig(tmp_path):
+def make_rig():
     rigs = []
 
     def make(**kw):
-        d = tmp_path / str(len(rigs))
-        d.mkdir()
-        r = Rig(d, **kw)
+        r = Rig(**kw)
         rigs.append(r)
         return r
 
@@ -164,59 +171,48 @@ def test_find_marker_end_to_end(make_rig):
     r = make_rig()
     t0 = time.monotonic()
     r.connect()
-    r.customer("/find marker")
-    done = "Search mission completed."
-    assert r.run_until(lambda: done in r.telegram.chat, max_sim_s=200.0, wall_s=25.0), r.telegram.chat
-    print(f"\n/find marker: {r.sim_t - 500:.0f} s sim, {time.monotonic() - t0:.1f} s wall")
-    for t in r.telegram.chat:
-        print("  >", t)
-    assert r.telegram.chat == [
-        "Request received. Sending your target to the robot.",
-        "The robot has started searching for: marker.",
-        "Target detected. Preparing to approach it.",
-        "The robot is approaching the target.",
-        "Search mission completed.",
-    ]
-    assert [s.state for s in r.sent_statuses] == ["ACCEPTED", "SEARCHING", "TARGET_DETECTED", "APPROACHING",
-                                                  "COMPLETED"]
+    mid = r.pi.request("marker")
+    assert r.run_until(lambda: "COMPLETED" in r.pi.states(mid), max_sim_s=200.0, wall_s=25.0), r.pi.statuses
+    print(f"\nfind marker: {r.sim_t - 500:.0f} s sim, {time.monotonic() - t0:.1f} s wall")
+    for s in r.pi.statuses:
+        print("  >", s.state, s.message)
+    expected = ["ACCEPTED", "SEARCHING", "TARGET_DETECTED", "APPROACHING", "COMPLETED"]
+    assert r.pi.states(mid) == expected
+    assert [s.state for s in r.sent_statuses] == expected
     mx, my = ITEMS["marker"]
     assert math.hypot(r.car.pose.x - mx, r.car.pose.y - my) < 1.4
-    m = r.pi.store.latest_for("photon", SPACE)
-    assert m.state.value == "COMPLETED"
     assert r.runtime.goal == ""
-    assert "found marker at (" in r.sent_statuses[2].message
+    assert "found marker at (" in r.pi.statuses[2].message
+    assert r.pi.last(mid).reason == ""
 
 
 def test_find_unicorn_not_found(make_rig):
     r = make_rig(search_timeout_s=40.0)
     t0 = time.monotonic()
     r.connect()
-    r.customer("/find unicorn")
-    assert r.run_until(lambda: any("couldn't spot" in t for t in r.telegram.chat), max_sim_s=120.0, wall_s=25.0), \
-        r.telegram.chat
-    print(f"\n/find unicorn: {r.sim_t - 500:.0f} s sim, {time.monotonic() - t0:.1f} s wall; {r.telegram.chat[-1]}")
-    assert r.telegram.chat[:2] == ["Request received. Sending your target to the robot.",
-                                   "The robot has started searching for: unicorn."]
-    last = r.telegram.chat[-1]
-    assert last.startswith("I couldn't spot unicorn. The search has ended. (")
-    assert "not found: unicorn" in last and "found: " in last
+    mid = r.pi.request("unicorn")
+    assert r.run_until(lambda: "FAILED" in r.pi.states(mid), max_sim_s=120.0, wall_s=25.0), r.pi.statuses
+    last = r.pi.last(mid)
+    print(f"\nfind unicorn: {r.sim_t - 500:.0f} s sim, {time.monotonic() - t0:.1f} s wall; {last.message}")
+    assert r.pi.states(mid) == ["ACCEPTED", "SEARCHING", "FAILED"]
+    assert (last.state, last.reason) == ("FAILED", "NOT_FOUND")
+    assert "not found: unicorn" in last.message and "found: " in last.message
     assert (r.sent_statuses[-1].state, r.sent_statuses[-1].reason) == ("FAILED", "NOT_FOUND")
-    assert not any("detected" in t.lower() for t in r.telegram.chat)
 
 
 def test_cancel_mid_search(make_rig):
     r = make_rig()
     t0 = time.monotonic()
     r.connect()
-    r.customer("/find unicorn")
-    assert r.run_until(lambda: "The robot has started searching for: unicorn." in r.telegram.chat, wall_s=10.0)
+    mid = r.pi.request("unicorn")
+    assert r.run_until(lambda: "SEARCHING" in r.pi.states(mid), wall_s=10.0), r.pi.statuses
     assert r.run_until(lambda: r.runtime.executor.status.state == SkillState.RUNNING, wall_s=5.0)
-    r.customer("/cancel")
-    assert r.run_until(lambda: "Mission cancelled." in r.telegram.chat, wall_s=10.0), r.telegram.chat
+    r.pi.cancel(mid)
+    assert r.run_until(lambda: "CANCELLED" in r.pi.states(mid), wall_s=10.0), r.pi.statuses
     print(f"\ncancel: {time.monotonic() - t0:.1f} s wall")
-    assert r.telegram.chat[-2:] == ["Cancelling... I'll confirm once the robot has stopped.", "Mission cancelled."]
+    assert r.pi.states(mid) == ["ACCEPTED", "SEARCHING", "CANCELLED"]
     st = r.runtime.executor.status
     assert st.call.name == SkillName.STOP and st.state == SkillState.SUCCEEDED
     assert r.runtime.executor.search_items == ()
+    assert r.runtime.goal == ""
     assert r.sent_statuses[-1].state == "CANCELLED"
-    assert r.pi.store.latest_for("photon", SPACE).state.value == "CANCELLED"

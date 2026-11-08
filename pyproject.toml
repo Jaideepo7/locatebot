@@ -9,10 +9,10 @@ dependencies = ["numpy>=1.24"]
 hardware = ["pyserial>=3.5"]
 link = ["pyzmq>=25"]
 dev = ["pytest>=7"]
-remote = ["websockets>=12"]
 # PostgreSQL storage (locatebot/storage); binary wheels exist for x86_64 and aarch64 (Pi 5, Orin)
 db = ["psycopg[binary]>=3.2"]
-pi = ["pigpio>=1.78"]
+# Pi 5 GPIO/I2C: pigpio does not work on the Pi 5 (RP1); gpiozero+lgpio for the ultrasonic, smbus2 for the PCA9685
+pi = ["gpiozero>=2.0", "lgpio>=0.2", "smbus2>=0.4"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -38,4 +38,4 @@ Tools: `tools/store_agent.py --chat | --serve` (POST `/message` `{user, text}` â
 - `--locator locate-anything` wraps `locatebot.vision.engine` but was not run here (needs the built engine and model on a GPU).
 - The grounding guard is a regex for aisles and stock words, not a full fact check; claims about the shelf rely on the prompt plus `verify_crop`.
 - No session expiry: a shopper who never finishes keeps the robot until `finish_guidance`.
-- SpacetimeDB catalog, Photon bridge wiring and `.lbmap`-based navigation are not built. Frames sent to the hosted API must contain no people.
+- A database-backed catalog, wiring to the Telegram (Spectrum) bridge and `.lbmap`-based navigation are not built. Frames sent to the hosted API must contain no people.

@@ -88,7 +88,7 @@ class OrinRuntime:
         self._last_state = self.executor.status.state
         self._confirmed: set[str] = set()
         self._stats = {"scans": 0, "frames": 0, "vision_results": 0, "fixes": 0, "no_range": 0, "steps": 0}
-        self._goal = ""               # what the operator / a Telegram customer wants, in words
+        self._goal = ""               # what the operator / a mission wants, in words
         self._goal_source = ""
         self._goal_set_s: float | None = None
         self._person_check_until = -math.inf  # M3: low-priority vision "person" check window

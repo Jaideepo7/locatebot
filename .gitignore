@@ -18,7 +18,6 @@ maps/*.yaml
 maps/*.png
 
 # Remote-control mission database (DISPATCH_DB_PATH)
-dispatch.db*
 
 # Storage writes waiting for the database (locatebot/storage/recorder.py)
 spool/

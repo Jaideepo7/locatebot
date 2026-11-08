@@ -39,13 +39,35 @@
 The brain wakes the LLM on events (an item confirmed, a skill ended, a safety stop). If the running skill is still right the LLM answers `continue`; re-calling the running skill also counts as continue (it is not restarted). Without this, mid-skill wake-ups either restarted the skill or counted as failures and tripped the fallback STOP (found by the end-to-end simulation).
 
 ## Goal (R4)
-`OrinRuntime.set_goal(text, source="operator")` / `clear_goal()` hold what the operator (or, from R3, a Telegram customer) wants, e.g. "find the bolt". It is validated (`normalize_goal`), timestamped, thread-safe, recorded as an event (`goal set: ... (by operator)` / `goal cleared`) and put into `WorldState.goal`, which the LLM sees as the first line of its state. A new goal wakes the brain. An operator STOP still pauses the brain: setting a goal does not resume it (`/resume` does).
+`OrinRuntime.set_goal(text, source="operator")` / `clear_goal()` hold what the operator (or a mission from the link) wants, e.g. "find the bolt". It is validated (`normalize_goal`), timestamped, thread-safe, recorded as an event (`goal set: ... (by operator)` / `goal cleared`) and put into `WorldState.goal`, which the LLM sees as the first line of its state. A new goal wakes the brain. An operator STOP still pauses the brain: setting a goal does not resume it (`/resume` does).
 
 ## Mission bridge (R3, `locatebot/orin/missions.py`)
-`MissionBridge(runtime, publish, clock=time.time)` turns Telegram/operator missions from the Pi into skills. `tools/orin_run.py --pi-host` wires it: `pi_source` subscribes `mission_request` / `mission_cancel` (not newest-only) and calls `on_message`; `OrinRuntime.step` calls `bridge.tick(now, ws)` after the brain (outside the runtime lock; never blocks); statuses go into `PiDriveSink.queue` and are sent by the drive-sender thread, which owns the PUB socket.
+`MissionBridge(runtime, publish, clock=time.time)` turns `MissionRequest` / `MissionCancel` messages from the Pi into skills. `tools/orin_run.py --pi-host` wires it: `pi_source` subscribes `mission_request` / `mission_cancel` (not newest-only) and calls `on_message`; `OrinRuntime.step` calls `bridge.tick(now, ws)` after the brain (outside the runtime lock; never blocks); statuses go into `PiDriveSink.queue` and are sent by the drive-sender thread, which owns the PUB socket.
 - Validation (from `JetsonAgent`): expired, more than 5 s in the future, `expires <= issued`, or a second concurrent mission → `FAILED` with `EXPIRED` / `CLOCK_SKEW` / `INVALID_EXPIRY` / `BUSY`; a duplicate id gets its last status again.
 - Start: `set_goal("find <target>", source="mission")`; with a brain it acts (approve/auto; a paused brain is resumed); without one the routine runs `search([target])`, then `go_to(item=target)`; a lost target re-searches at most twice.
-- Status mapping, cancel and link loss: see the table in `docs/remote/README.md`. Target matching: case-insensitive exact item name, so wording matters (short nouns, `docs/vision/README.md`).
+- Target matching: case-insensitive exact item name, so wording matters (short nouns, `docs/vision/README.md`).
+- No Pi-side sender exists yet: the Python Photon/Telegram service that used to send missions (`locatebot/remote/`) was retired on 2026-11-08, because Telegram now goes through `my-spectrum-app/` straight to the operator HTTP API. The bridge stays for a future Pi-side sender; `tests/orin/test_mission_e2e.py` drives it with a fake Pi over 127.0.0.1 ZeroMQ.
+- Mission times on the link are Unix wall clock (`issued_s`, `expires_s`): run NTP/chrony on both boards.
+
+| Orin observes | Status sent |
+|---|---|
+| mission started (goal set, routine search issued) | `ACCEPTED` |
+| `search` / `explore` / `look_around` running | `SEARCHING` |
+| a track named like the target becomes **confirmed** | `TARGET_DETECTED` (message: map position) |
+| `go_to(item=target)` running | `APPROACHING` |
+| that `go_to` succeeded | `COMPLETED` |
+| a search for the target ended without it | `FAILED` `NOT_FOUND` (message: the executor's found/missing text) |
+| `go_to` found no path | `FAILED` `NO_PATH` |
+| mission TTL reached on the Orin | `FAILED` `TIMEOUT` (the robot is stopped) |
+| executor internal error | `FAILED` `ROBOT_FAULT` (the robot is stopped) |
+| someone else stopped the robot (operator page STOP, LLM `stop`, fallback) | `FAILED` `STOPPED` |
+| `MissionCancel` → operator STOP → executor stopped | `CANCELLED` |
+| `go_to` lost the target, then a search runs again | `SEARCHING` (from `APPROACHING`/`TARGET_DETECTED`) |
+| request expired / > 5 s in the future / `expires <= issued` / another mission active | `FAILED` `EXPIRED` / `CLOCK_SKEW` / `INVALID_EXPIRY` / `BUSY` (a sender should treat this first status as a rejection) |
+
+Each state is sent once, in the allowed transition order (`missions.TRANSITIONS`). A missing intermediate state is filled in only when it is true (e.g. `go_to` to a target already on the map gives `SEARCHING`, `TARGET_DETECTED`, `APPROACHING`). A duplicate request id gets the last status again and is never started twice.
+
+**Cancel:** `MissionCancel` → operator `STOP` (with an LLM brain this also pauses it) and the goal is cleared → `CANCELLED` once the executor shows that STOP finished (or after 3 s with nothing running). **Link loss:** the Orin stops the robot when it hears no Pi scan for 2 s and keeps the mission; when scans return it re-reports the current state and resumes (routine: re-issues the current step; LLM: resumes the brain). The Pi's own safety stop already halts the car when Orin commands stop.
 - `runtime.status()["missions"]`: active mission (id, target, state, step, link_down, expires_in_s), `link_up`, counters.
 
 ## Timing (measured)

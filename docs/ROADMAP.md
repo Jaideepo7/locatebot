@@ -10,23 +10,28 @@ Written 2026-11-08 by the integrator session. Read `docs/PROJECT.md` and `AGENTS
 
 ```text
 C  contracts ─┬─ G0 hardware facts ── G1 Pi drives safely ── G2 Orin drives the car ── G5 LLM live ── G6 event-ready
-              ├─ G3 storage (SpacetimeDB on the Pi) ── G4 dashboard ───────────────────┘
-              ├─ R  remote control: Photon/Telegram on the Pi ──────────────────────────┘
+              ├─ G3 storage (PostgreSQL on the Pi, built) ── G4 dashboard ───────┘
+              ├─ R  remote control: superseded (Spectrum bridge → Orin operator API) ───┘
               └─ M  smart map (long-term map, people, ultrasonic layer) ── validated on the car after G2
 ```
 
 ## What is done (2026-11-08)
 LiDAR driver (verified on the real C1), mapping + `.lbmap`, scan matching, safety supervisor (LiDAR only), Pi control loop + manual-drive page (fake motor), ZeroMQ link (loopback only), vision on the Orin GPU (~2.1 s/item at 640 px), item localization, Nav-lite, skill executor, LLM brain with `continue` + fallback, Orin runtime + operator page + live radar. 540 tests pass on the laptop and the Orin. Nothing has driven a real car.
 
+**Later on 2026-11-08:** the car's hardware is known (Raspberry Pi 5 on a Freenove-style 4WD board, skid steering; D1–D3, D6 below); standalone prototype scripts drove it (`prototypes/pi5_freenove/README.md`); the package has a real driver, `PCA9685SkidSteer` (fake I2C bus tests only, not wired in). Telegram = the Spectrum bridge in `my-spectrum-app/` (R superseded). Storage = PostgreSQL on the Pi (G3, in progress). The store-guide agent (`locatebot/store/`, mock robot) is a second use case.
+
 ## Open decisions (owner: the team, not an agent)
 | # | Decision | Blocks |
 |---|---|---|
-| D1 | Motor/steering hardware: ESC + steering servo, H-bridge + servo, or a motor HAT? Which Pi pins? | T1.1 |
-| D2 | Where the LiDAR lives on the car: **Pi** (design: safety stop next to the motors) or Orin (current bench setup). Collision detection on the Pi needs the LiDAR on the Pi. Recommended: Pi. | T1.2, T1.3 |
-| D3 | Pi 4 RAM size (2/4/8 GB) and OS (must be 64-bit for SpacetimeDB) | T3.1 placement |
+| D1 | **Answered 2026-11-08:** 4 DC motors through H-bridges fed by a PCA9685 (I2C `0x40`, channels 0–7), skid steering, no steering servo, no wheel encoders. Map: `prototypes/pi5_freenove/README.md`; driver: `locatebot/pi/pca9685_motor.py` | T1.1 |
+| D2 | **Answered 2026-11-08: the LiDAR is on the Pi** (USB, `/dev/ttyUSB0`), as designed. Car front = LiDAR 2.4°; it sees the car's body behind it (needs an angle mask). The Orin's `--lidar-port` mode is a bench tool only | T1.2, T1.3 |
+| D3 | **Answered 2026-11-08: Raspberry Pi 5**, Raspberry Pi OS (Debian 13 trixie). RAM size not recorded yet. pigpio does not work on the Pi 5: use gpiozero / lgpio | storage placement |
 | D4 | **Decided 2026-11-08: Nemotron through NVIDIA's API** (OpenAI-compatible `https://integrate.api.nvidia.com/v1`, key in `NVIDIA_API_KEY`): `tools/orin_run.py --llm nemotron --llm-model <id>`. Still open: which model id (must support tool calling), and internet at the event (D5). The LLM chooses skills; it never sends throttle/steering. | G5 |
-| D5 | Telegram remote control at the event needs internet; is a hotspot allowed? | R tasks go live |
-| D6 | Camera model and mount (USB webcam or Pi camera module) | T1.4, T2.4 |
+| D5 | Telegram at the event (the Spectrum bridge) and the Nemotron API need internet; is a hotspot allowed? | Telegram + G5 go live |
+| D6 | **Answered 2026-11-08:** OV5647 on CSI, on a pan/tilt servo (PCA9685 ch 8/9), no rotation needed. Mount offset and field of view still to measure (T2.4) | T1.4, T2.4 |
+| D7 | **Decided 2026-11-08: storage = PostgreSQL on the Pi 5**, not SpacetimeDB (SpacetimeDB keeps all data in memory, a bad fit for robot photos on the Pi; Postgres suits several machines and both Python and Node) | G3 |
+| D8 | **Decided 2026-11-08: Telegram = the Node Spectrum bridge** (`my-spectrum-app/`) calling the Orin operator HTTP API; the Python Photon service is retired | R |
+| D9 | **Open:** how the Pi ↔ Orin ZeroMQ link is bound on the real car (which side binds, which connects). The Orin is the server for operators (HTTP API on 8090), but the link binding is not confirmed | T1.3 |
 
 ---
 
@@ -41,15 +46,16 @@ LiDAR driver (verified on the real C1), mapping + `.lbmap`, scan matching, safet
 - `OrinStatus.boot_id` (random per process start) so the Pi knows when to reset drive `seq` (transport lane proposal).
 **C2. `locatebot/safety/supervisor.py`**: add `Reason.FAULT` (Pi lane proposal) and `Reason.ULTRASONIC` (see T1.2).
 **C3. `locatebot/mission/types.py`**: add `WorldState.goal: str = ""` (the operator's request in words) and `WorldState.people: tuple[PersonView, ...] = ()` (`PersonView`: x, y, range_m, bearing_rad, speed_mps, confirmed_by_camera). Make `SKILL_ARGS[SEARCH]["items"]` a `tuple` (agent lane proposal: keeps `SkillCall` hashable).
-**C4. `pyproject.toml`** extras: `pi = ["pigpio>=1.78"]` (or `lgpio`), `remote = ["websockets>=12"]`, `storage = []` (bridge uses stdlib HTTP).
+**C4. `pyproject.toml`** extras: `pi = ["pigpio>=1.78"]` (or `lgpio`), `remote = ["websockets>=12"]`, `storage = []` (bridge uses stdlib HTTP). *Update 2026-11-08:* pigpio does not work on the Pi 5 (use gpiozero / lgpio), and the `remote` extra is unused since the Python remote service was retired; both are for the integrator to change.
 **Acceptance:** whole suite passes; encode/decode round-trip tests for every new message; README tables in `docs/link/README.md` updated.
 
 ---
 
 ## G0 — hardware facts (people, not agents) [HW]
 Must be done before G1 hardware tasks. Write every answer into `docs/hardware/README.md` (new).
+**Status 2026-11-08:** D1, D2, D3, D6 answered from the real car; the measurements live in `prototypes/pi5_freenove/README.md` (no `docs/hardware/README.md` yet). Wheelbase/steering-angle items don't apply to a skid-steered car. Not recorded yet: network setup (item 3), a separate physical kill switch (the board's "Load" switch cuts motor power; the prototype README says there is no hardware kill switch), the HC-SR04 mount tilt and how its echo is level-shifted on this board.
 1. **Motor/steering (D1):** open the car; photograph the ESC/driver and servo; note voltages, connectors, whether the ESC needs arming, whether it has reverse/brake, steering servo pulse range. Measure **wheelbase**, **track width**, **max steering angle each way**.
-2. **Pi 4:** RAM size, flash 64-bit Raspberry Pi OS (Bookworm) or Ubuntu 24.04 arm64, Python ≥ 3.10, clone repo, `pip install -e '.[hardware,link,dev]'`, run the suite (expect all pass).
+2. **Pi 5** (runs Raspberry Pi OS, Debian 13 trixie): RAM size, Python ≥ 3.10, clone repo, `pip install -e '.[hardware,link,dev]'`, run the suite (expect all pass).
 3. **Network:** Pi ↔ Orin Ethernet with fixed IPs on a private subnet; team router/hotspot for laptop + phones; note addresses in a git-ignored `.env`, never in the repo.
 4. **Mounts:** LiDAR at 20–30 cm height, level, clear 360° (D2); camera facing forward (D6); HC-SR04 front centre, 5–10° downward tilt; physical **kill switch** in the motor battery line.
 5. **HC-SR04 wiring:** VCC 5 V, GND, TRIG to a GPIO, **ECHO through a divider (1 kΩ / 2 kΩ) to a 3.3 V GPIO** (5 V on a Pi pin can damage it).
@@ -60,6 +66,7 @@ Must be done before G1 hardware tasks. Write every answer into `docs/hardware/RE
 
 ## G1 — the Pi drives the car safely
 ### T1.1 Real motor + steering driver [HW, needs D1]
+**Status 2026-11-08:** the driver for this car exists: `locatebot/pi/pca9685_motor.py` (`PCA9685SkidSteer`, tested on a fake I2C bus). The ESC/servo/pigpio spec below is superseded (no ESC, no servo, pigpio does not work on the Pi 5). Still to do: wire it into `tools/pi_drive.py` (e.g. a `--motor` flag), add a **hardware failsafe** (watchdog on the PCA9685 OE pin or motor power; the chip keeps its last PWM if the process dies), and run the bench checklist below.
 - **Goal:** `locatebot/pi/motor_pwm.py` implementing `MotorDriver` (`set(throttle, steering)`, `stop()`, `close()`) for the hardware in D1.
 - **Context:** `locatebot/pi/motor.py` (protocol + `FakeMotor`), `docs/pi/README.md`, `locatebot/pi/control.py` (only caller).
 - **Spec:** hardware PWM via pigpio (Pi 4: GPIO 12/13/18/19 support hardware PWM) or lgpio; 50 Hz servo-style pulses for ESC + servo (typ. 1000–2000 µs, neutral 1500 µs, *from D1 measurements*); clamp to [-1, 1]; per-car calibration file `config/car.yaml` (neutral, max forward, steering left/right/centre, deadband, reverse disabled); `stop()` = neutral throttle + centred steering; ESC arming sequence if needed; `close()` leaves neutral. Never raise from `stop()`.
@@ -70,7 +77,7 @@ Must be done before G1 hardware tasks. Write every answer into `docs/hardware/RE
 ### T1.2 Collision detection: LiDAR + HC-SR04 fused on the Pi [SW now, HW later; needs C1, C2]
 - **Goal:** the Pi safety supervisor stops the car when *either* sensor sees an obstacle in the path, and fails closed when a sensor is missing.
 - **Context:** `locatebot/safety/supervisor.py` + `docs/safety/README.md` (LiDAR policy, reasons, corridor, coverage), `locatebot/pi/control.py` (`tick` calls `evaluate`), `docs/lidar/README.md` (NaN = unknown, never free).
-- **Driver** `locatebot/pi/ultrasonic.py`: trigger 10 µs pulse, time the echo with pigpio callbacks (not busy-wait), 40–60 ms cycle, timeout = no echo (`None`), median of last 3, speed of sound with optional temperature, valid 0.03–4.0 m; background thread; `latest() -> (stamp_s, range_m | None)`. Fake backend for tests.
+- **Driver** `locatebot/pi/ultrasonic.py` (HC-SR04 on GPIO 27 trigger / 22 echo; gpiozero `DistanceSensor` or lgpio, **not pigpio**, which does not work on the Pi 5): trigger 10 µs pulse, time the echo with callbacks (not busy-wait), 40–60 ms cycle, timeout = no echo (`None`), median of last 3, speed of sound with optional temperature, valid 0.03–4.0 m; background thread; `latest() -> (stamp_s, range_m | None)`. Fake backend for tests.
 - **Fusion** (new `SafetyConfig` fields, all placeholders until measured): `us_stop_m` (default 0.35), `us_slow_m` (0.8), `us_timeout_s` (0.3), `us_required` (True once the sensor is fitted).
   - Ultrasonic reading ≤ `us_stop_m` while moving forward → stop, `Reason.ULTRASONIC`.
   - Between stop and slow → throttle cap, same linear ramp as the LiDAR slow zone; the more restrictive of LiDAR and ultrasonic wins.
@@ -79,12 +86,14 @@ Must be done before G1 hardware tasks. Write every answer into `docs/hardware/RE
   - Order of checks stays fail-closed: e-stop → clock → scan → command → validity → reverse → coverage → LiDAR obstacle → ultrasonic → slow-down.
 - **Link:** publish `Range` messages to the Orin (C1) at 10 Hz for the map layer and the LLM.
 - **Tests:** synthetic scan + fake ultrasonic matrix (glass ahead: LiDAR clear/ultrasonic 0.3 m → stop; both clear → OK; ultrasonic stale → crawl; LiDAR stale → stop regardless; steering-in-place allowed); property test that output throttle never exceeds any single sensor's cap.
+- **Why it matters (measured 2026-11-08):** dark trousers and a ~30 cm box below the scan plane were invisible to the LiDAR; the ultrasonic saw both.
 - **Bench later [HW]:** glass door, shoe on the floor, cardboard box; record stop distances at 3 speeds into `docs/safety/README.md`.
 - **Done when:** suite passes, docs updated, bench table filled.
 
 ### T1.3 Pi ↔ Orin link wiring + camera capture on the Pi [SW now; needs C1]
 - **Goal:** `tools/pi_drive.py` (or a new `tools/pi_run.py`) becomes the full Pi process: LiDAR → safety + Orin, camera → Orin, Orin drive → safety → motor.
 - **Context:** `locatebot/link/transport.py` (`Publisher`, `Subscriber`, `DriveReceiver`, endpoints; read its README section on newest-only and seq), `locatebot/pi/control.py` (`submit_mission(DriveCmd)`, `reset_mission_seq`), `docs/link/README.md` (drive/e-stop rules: network release never releases e-stop).
+- **Open (D9):** which side binds on the real car is not confirmed; the spec below is the current code's layout.
 - **Spec:** PUB on 5555: every scan, `pi_status` at 2 Hz, `Range` at 10 Hz, camera `Frame` at 2 Hz (640 px JPEG, quality ~80, capture time = Pi monotonic at exposure). SUB to the Orin on 5556 via `DriveReceiver`; reset seq when `OrinStatus.boot_id` changes. Camera backend interface with `FakeCamera` (tests), `V4l2Camera` (USB, via OpenCV or `v4l2-ctl`-free pure approach), `PiCamera2Camera` (libcamera); choose by flag; camera failure never affects driving. Threads: lidar, camera, link-in, control 20 Hz, page server.
 - **RAM budget:** measure RSS on the Pi; target < 200 MB for this process.
 - **Tests:** loopback end-to-end: fake LiDAR + fake camera on the "Pi" side, `orin_run.py`-style subscriber on the "Orin" side in the same test: scans and frames arrive, drive commands drive `FakeMotor`, stale drive → stop, Orin restart (new boot_id) → seq reset.
@@ -97,7 +106,7 @@ Measure braking distance at the capped speed, sensing latency, car width; set `S
 
 ## G2 — the Orin drives the car
 ### T2.1 Vehicle + pursuit calibration [HW, needs G1]
-Fill `VehicleConfig` from G0 measurements; measure speed vs throttle (time 3 m at 3 throttles) for `max_speed_mps`; check `steering = +1` turns left; tune `PursuitConfig` (lookahead, `min_throttle_frac` must not stall, `goal_tolerance_m`). Drive `go_to` to taped floor marks 10 times; record error. Context: `docs/nav/README.md` ("To measure or tune on the real car").
+Fill `VehicleConfig` from G0 measurements (skid-steered car: see "skid-steer navigation model" in the open items below); measure speed vs throttle (time 3 m at 3 throttles) for `max_speed_mps`; check `steering = +1` turns left; tune `PursuitConfig` (lookahead, `min_throttle_frac` must not stall, `goal_tolerance_m`). Drive `go_to` to taped floor marks 10 times; record error. Context: `docs/nav/README.md` ("To measure or tune on the real car").
 
 ### T2.2 Odometry while driving [HW + SW]
 Record `.lbscan` logs while driving loops at 3 speeds; replay with `tools/build_map.py`; measure loop-closure error and rejected-scan rate. If heading drifts on turns: add an IMU (MPU6050 on the Pi I²C, gyro z only) as a motion prior to `ScanOdometry.update` (prediction instead of constant velocity). Investigate the one-off 14° heading jump seen on the bench (2026-11-08, `docs/orin/README.md`) with a 10-minute static log.
@@ -112,52 +121,21 @@ Measure camera HFOV (`--hfov-deg`) and its position relative to the LiDAR (`Loca
 
 ---
 
-## G3 — local storage: SpacetimeDB on the Pi [SW now; needs C3, D3]
-### T3.1 SpacetimeDB server + module
-- **Facts:** official Linux **aarch64** build exists (`spacetime-aarch64-unknown-linux-gnu`, v2.14.1, 2026-11-04); needs a 64-bit OS. Use the docs via context7 for the 2.x module/HTTP APIs; don't rely on memory.
-- **Placement:** on the Pi (keeps Orin RAM for vision); measure RSS idle and under load on the Pi; fall back to the laptop if it exceeds ~400 MB or the Pi has 2 GB.
-- **Module** (TypeScript) `spacetime/locatebot/`: tables `robot_status` (one row: pose, skill, safety, estop, link health, updated_at), `item` (name, x, y, sigma, sightings, confirmed, first/last seen, photo_ref), `event` (t, kind, text), `mission` (id, source (dashboard/telegram), target, state, created/updated), `map_session` (name, file path on disk, created, size, scans), `health` (pi/orin CPU, RAM, temps, gpu, vision latency, scans/s). Reducers for each write; retention (keep last N events).
-- **Rules:** the robot must work if SpacetimeDB is down; no internet; data dir under `/var/lib/locatebot/spacetime` (git-ignored); systemd unit.
-- **Done when:** module publishes on the Pi; a test script writes and reads every table; RAM measured.
-
-### T3.2 Python bridge [SW, needs T3.1 schema]
-`locatebot/storage/bridge.py`: background thread with a bounded queue that turns `OrinApp.status()`, events, item updates and mission changes into reducer calls over SpacetimeDB's HTTP API (stdlib `urllib`); rate-limited (status ≤ 2 Hz); drops on overflow; never blocks the control loop; reconnects. Map files stay on disk (`maps/`), only metadata in the DB. Tests against a stub HTTP server; one integration test against a real local server (skipped if absent).
+## G3 — local storage: PostgreSQL on the Pi 5 [built 2026-11-08; deploy on the Pi pending]
+**Decision 2026-11-08 (D7):** PostgreSQL on the Pi 5, not SpacetimeDB. SpacetimeDB keeps all data in memory, a bad fit for robot photos on the Pi; multi-machine, multi-language access (Python + Node) favours Postgres. Built in `locatebot/storage/` (see `docs/storage/README.md`): photos (deduplicated, size-capped), sightings, found items with their best photo, events, missions and map snapshots; a disk spool keeps writes while the database is down. Remaining: run `deploy/postgres/setup_pi.sh` on the Pi, measure RAM there, let the chat bridge send found-item photos. The earlier SpacetimeDB plan (T3.1 server + module, T3.2 HTTP bridge) is superseded.
+- **Rules that still hold:** the robot must work fully if the database is down; no internet; writes never block the control loop.
 
 ---
 
 ## G4 — dashboard [SW, needs T3.1]
-React + TypeScript + SpacetimeDB client, **all assets bundled, no CDN**, served by the Pi (static files from a stdlib server or the SpacetimeDB host). Screens (`docs/PROJECT.md` §9): Mission (live map from `/map.png` + overlay of pose/items, skill, approve/reject LLM proposals, skill buttons, goal text box), Health, Manual drive (talks to the Pi page endpoints `/drive` `/estop` `/release`, hold-to-drive semantics identical to `locatebot/pi/server.py`), Radar (port of `/radar`). E-stop visible on every screen. Replaces the two stdlib pages only after it matches them (keep them as fallbacks). Check in headless Chromium like the stdlib pages (CDP script approach in `docs/orin/README.md`).
+React + TypeScript, **all assets bundled, no CDN**, served locally (the database client depends on G3). Screens (`docs/PROJECT.md` §9): Mission (live map from `/map.png` + overlay of pose/items, skill, approve/reject LLM proposals, skill buttons, goal text box), Health, Manual drive (talks to the Pi page endpoints `/drive` `/estop` `/release`, hold-to-drive semantics identical to `locatebot/pi/server.py`), Radar (port of `/radar`). E-stop visible on every screen. Replaces the two stdlib pages only after it matches them (keep them as fallbacks). Check in headless Chromium like the stdlib pages (CDP script approach in `docs/orin/README.md`).
 
 ---
 
-## R — remote control via Photon/Telegram, on the Pi (rework of `feat/photon-dispatch`)
-**Status 2026-11-08: R1–R4 done in software** (branch `remote/lane`, merged via `rm-integration`): messaging core in `locatebot/remote/`, Photon inbound over **Socket.IO** (Photon's WebSocket delivery is Socket.IO, per its docs), `tools/remote_run.py`, LLM goal input, mission bridge over ZeroMQ. Not yet run against real Photon/Telegram, the Pi or the cable (R5).
-**Review of the branch (2026-11-08):** 4 commits by chanabyte, 39 files, ~4,700 lines; branched before the Pi+Orin runtime existed. It merges onto `main` with one trivial `.gitignore` conflict and all 867 tests pass together. Verdict: **keep the messaging half, replace the robot half.**
-
-| Part | Fit | Action |
-|---|---|---|
-| `backend/messaging/photon.py` (Standard Webhooks verification, `message.received` parsing, send client), `commands.py` (`/find /status /cancel /help`), `notifier.py` (outbox, retries, `Retry-After`), `store.py` (SQLite dedupe + outbox in one transaction), `missions.py` rules (one active mission, ownership, rate limit, timeouts), `config.py` (secret-safe env) | Good, transport-agnostic, well tested | **Keep**, move to `locatebot/remote/` |
-| Inbound via public HTTPS webhook (needs a tunnel; "backend runs off the robot") | Wrong for the Pi | Replace with Photon **WebSocket delivery** (documented for processes without a public HTTP endpoint); keep webhook mode optional |
-| FastAPI + uvicorn | Heavy for the Pi; rest of the repo is stdlib HTTP | Drop; stdlib `ThreadingHTTPServer` for the few local operator routes |
-| `dispatch/ws_client.py` + Jetson `websockets` robot link | Duplicates our ZeroMQ link, adds a dependency on the Orin | **Replace** with `MissionRequest/Cancel/Status` over the existing link (C1) |
-| `dispatch/agent.py` (`JetsonAgent`) + `MissionSink` | Good state machine; wrong side and transport | Keep the logic, run it on the **Orin** behind the ZeroMQ link (T R3) |
-| `ScriptedSink`, `tools/fake_jetson.py` | Useful for tests | Keep as test fakes |
-| "Mission" = single `target_description` | Our robot has skills + LLM | Map onto `WorldState.goal` + `search`/`go_to` (T R3) |
-
-### R1. Port the messaging core to `locatebot/remote/` [SW, needs C1]
-Move/adapt photon, commands, notifier, store, missions, config from `origin/feat/photon-dispatch` with their tests; keep history (`git checkout origin/feat/photon-dispatch -- <paths>` then `git mv`); remove FastAPI; credit the original commits in the message. All tests green without the `backend` extra.
-
-### R2. Photon WebSocket inbound + Pi service [SW now, live test needs D5]
-Implement the Photon WebSocket delivery client per `https://docs.photon.codes/docs/beta/message-delivery/websocket.md` (read it first; same event object as webhooks): outbound connection from the Pi, auth with the project key from env, reconnect with backoff, dedupe by event id in the SQLite store, same handlers as the webhook path. Process `tools/remote_run.py` on the Pi; RAM target < 80 MB; robot keeps working when offline (Telegram replies "robot offline / no internet").
-
-### R3. Mission bridge on the Orin [SW, needs C1, C3, R1]
-`locatebot/orin/missions.py`: receives `MissionRequest` over the link → validates (expiry, one at a time) → sets `WorldState.goal` = "find <target>" and either lets the LLM act (approve/auto) or, with `--llm none`, runs the routine `search([target])` then `go_to(target)`. Maps executor/tracker events to `MissionStatus`: ACCEPTED on start, SEARCHING when search runs, TARGET_DETECTED when the target track is confirmed (include map position), APPROACHING on `go_to`, COMPLETED on arrival, FAILED with `NOT_FOUND` / `NO_PATH` / `TIMEOUT`; `MissionCancel` → operator STOP → CANCELLED once stopped. Link loss to the Pi → stop (safety on the Pi also stops). Reuse `JetsonAgent`'s duplicate/expiry/one-at-a-time rules. Tests in simulation using `tests/orin/test_e2e_sim.py` patterns.
-
-### R4. Brain goal input [SW, needs C3]
-`render_world_state` prints `goal: <text>` at the top; the system prompt says to work towards the goal and call `stop` when it is done; goal set/cleared via `OrinRuntime.set_goal()` and the operator page text box. Tests: goal appears in the prompt; scripted policy reaches COMPLETED in the e2e sim.
-
-### R5. Live Photon test [HW/people, needs D5, R2, G2]
-Follow TEST-PLAN L1–L4 from the branch (`docs/dispatch/TEST-PLAN.md`): real project, Telegram bot, one captured event (PII removed) replacing the synthetic fixture; confirm `senderId` and `format: "plain"` behaviour.
+## R — remote control via Photon/Telegram — superseded 2026-11-08
+**Telegram = the Node Spectrum bot in `my-spectrum-app/`** (D8), which calls the Orin operator HTTP API directly (`context.md` §9). The Python Photon service on the Pi that R1–R3 built (`locatebot/remote/`, `tools/remote_run.py`, branch `remote/lane`) was a duplicate and has been removed; its briefs R1, R2, R3, R5 are retired (git history keeps them).
+- **Kept:** R4 (goal input for the LLM: `OrinRuntime.set_goal`, `WorldState.goal`), and the Orin half of R3: `MissionBridge` (`locatebot/orin/missions.py`) with the `MissionRequest` / `MissionCancel` / `MissionStatus` messages, for a future Pi-side mission sender. Its status mapping is in `docs/orin/README.md`; `tests/orin/test_mission_e2e.py` drives it with a fake Pi over 127.0.0.1 ZeroMQ.
+- **Still open for Telegram:** a live end-to-end run of the Spectrum bridge against the robot; internet at the event (D5).
 
 ---
 
@@ -172,13 +150,25 @@ Leg-pair/blob tracker with velocity (Kalman or α-β), `WorldState.people`; came
 
 ---
 
-## G5 — LLM live [needs G2, D4, R4]
+## G5 — LLM live [needs G2, D4, R4 (done)]
 Pick the Nemotron model id on build.nvidia.com that supports tool calling; check the reply parser handles its output (some Nemotron reasoning models also return `reasoning_content`, and some take a system-prompt switch for reasoning on/off); measure decision latency. Run it against the real robot in **approve** mode; log every prompt/answer; tune the system prompt on 10 real missions; measure latency and cost; confirm fallback (pull the hotspot mid-mission → robot finishes the skill and stops). Context: `docs/agent/README.md`, `locatebot/agent/llm.py`.
 
 ## G6 — event-ready [needs everything above]
-systemd units with auto-restart and `MemoryMax=` (Pi: `pi_run`, `remote_run`, SpacetimeDB; Orin: `orin_run` with vision); boot order and health checks; offline kit (wheels/pip cache, npm bundle, model, SpacetimeDB binary on both devices); full dry run with Wi-Fi off (local dashboard only); failure drills (cable, Orin, LLM, Telegram, SpacetimeDB down); battery plan; demo script.
+systemd units with auto-restart and `MemoryMax=` (Pi: `pi_run`, PostgreSQL; Orin: `orin_run` with vision; the Telegram bridge wherever it runs); boot order and health checks; offline kit (wheels/pip cache, npm bundle, model, PostgreSQL on the Pi); full dry run with Wi-Fi off (local dashboard only); failure drills (cable, Orin, LLM, Telegram, database down); battery plan; demo script.
 
 ---
 
+## Open items added 2026-11-08 (from the car and the store agent)
+| Item | What | Kind |
+|---|---|---|
+| O1 | **Skid-steer navigation model:** Nav-lite (pure pursuit, bicycle sim) and the safety corridor assume a car-like (Ackermann) chassis; on the skid-steered car they work only approximately through the motor driver's left/right mix. Add a differential-drive model (turn on the spot, unicycle sim). | SW |
+| O2 | **Wire `PCA9685SkidSteer` into the Pi program** (`tools/pi_drive.py` / T1.3) + **hardware failsafe** (watchdog on the PCA9685 OE pin or motor power). | SW + HW |
+| O3 | **LiDAR body mask + 2.4° front offset** in the package: mask the rear angles where the LiDAR sees the car (returns ~0) and rotate scans so 0 = car front. | SW, check on the car |
+| O4 | **Camera pan angle in item localization:** the camera is on a pan servo, so a bearing must add the pan angle at capture time (today localization assumes a fixed camera). | SW |
+| O5 | **Shared vision worker** between the search skills and the store agent, so they don't load LocateAnything twice on the Orin. | SW |
+| O6 | **Who controls the robot:** arbitration between the skills brain (LLM / operator / missions) and the store agent. | SW, decision |
+| O7 | **Named places / waypoints on the map** (aisles, `ENTRANCE`, home) for the store agent's `navigate_to`. | SW |
+| O8 | **Measured turns:** timed turns are unreliable on shiny floors; turn by scan matching or a gyro. | SW + HW |
+
 ## What can start in parallel right now (no hardware needed)
-After **Step C** is merged: **T1.2** (fusion logic + fake ultrasonic), **T1.3** (link wiring + fake camera), **T2.3** (background planner), **T3.1 + T3.2** (SpacetimeDB on the laptop first), **R1 → R2/R3/R4**, **M1 → M2**. Hardware-gated: T1.1, T1.4, T2.1, T2.2, T2.4, R5, G5, G6.
+After **Step C** is merged: **T1.2** (fusion logic + fake ultrasonic), **T1.3** (link wiring + fake camera), **T2.3** (background planner), **M1 → M2**, and **O1, O3–O7** above. G3 storage is the integrator's (in progress). Hardware-gated: T1.1 bench, T1.4, T2.1, T2.2, T2.4, O2 failsafe, G5, G6.
