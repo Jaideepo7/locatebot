@@ -9,6 +9,8 @@ dependencies = ["numpy>=1.24"]
 hardware = ["pyserial>=3.5"]
 link = ["pyzmq>=25"]
 dev = ["pytest>=7"]
+remote = ["websockets>=12"]
+pi = ["pigpio>=1.78"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
