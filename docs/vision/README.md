@@ -55,4 +55,13 @@ The times include loading the 4.7 GB model on every CLI call and are CPU-only, s
   ```
 - Tests (`tests/vision/`) compile `fake_la_capi.c` into a fake `liblocate_anything.so`; they prove the binding, not the real model or the Orin GPU build.
 
-Next: the vision daemon (`service.py`: newest-frame worker, item rotation, heartbeat).
+## Vision worker (built, tested with a fake engine)
+`locatebot/vision/service.py`: `VisionService(engine, on_result, hfov_rad, mode, on_heartbeat)`.
+- `submit_frame(jpeg, capture_s)` keeps only the newest frame; a frame replaced before any call used it counts as dropped.
+- `set_items([...])` one item per call, rotating; each item runs at most once per frame, then the worker waits for a new frame.
+- A running call can't be cancelled; if its item was removed meanwhile the result is discarded.
+- Every finished call emits a `VisionResult` (item, frame capture time, cleaned boxes with bearings, latency), including "nothing found".
+- `pause()` / `resume()` / `status()`; heartbeat callback every `heartbeat_s` with counters, last latency, last error.
+- Engine errors and callback exceptions are logged and counted; the worker keeps running.
+
+Not built yet: the transport (ZeroMQ frames in from the Pi, results/heartbeat out), `config/camera.yaml`, and the `systemd` unit. Those need the Pi <-> Orin link format and the `pyzmq` dependency.
